@@ -44,6 +44,16 @@ on:
         type: boolean
         default: true
         required: true
+      ttlang_ref:
+        description: "tt-lang SHA or tag to build the wheels from. Leave empty to use the triggering commit."
+        type: string
+        default: ""
+        required: false
+      apply_patches:
+        description: "Apply wheel patches from .github/wheel-patches/ before building (e.g., correct the numpy version constraints when rebuilding an older ref)."
+        type: boolean
+        default: false
+        required: false
 
 concurrency:
   group: publish-s3-pypi-${{ github.ref }}
@@ -73,6 +83,7 @@ jobs:
       - name: Checkout tt-lang
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.ttlang_ref || github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -98,6 +109,7 @@ jobs:
     secrets: inherit
     with:
       push: true
+      ttlang_sha_override: ${{ inputs.ttlang_ref }}
 
   build-wheel-images:
     needs: preflight
@@ -107,6 +119,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/call-build-wheel-images.yml
     secrets: inherit
+    with:
+      ttlang_sha_override: ${{ inputs.ttlang_ref }}
 
   build-standard-wheels:
     needs: [preflight, build-docker]
@@ -129,6 +143,8 @@ jobs:
       build_sim_wheel: true
       allow_final_internal_version: ${{ needs.preflight.outputs.allow_final_internal_version == 'true' }}
       artifact_name: tt-lang-wheels-${{ matrix.wheel_variant }}
+      ttlang_sha_override: ${{ inputs.ttlang_ref }}
+      apply_patches: ${{ github.event_name == 'workflow_dispatch' && inputs.apply_patches }}
 
   build-light-wheels:
     needs: [preflight, build-docker, build-wheel-images]
@@ -155,17 +171,36 @@ jobs:
       - name: Checkout tt-lang
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.ttlang_ref || github.sha }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Fix git safe directory
         run: git config --global --add safe.directory '*'
 
+      # The patch runner and patches come from the workflow commit, not the
+      # (possibly older) target ref being rebuilt, which may predate them.
+      - name: Check out wheel patches from the workflow commit
+        if: ${{ inputs.apply_patches }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .wheel-patch-src
+          sparse-checkout: |
+            .github/scripts/apply-wheel-patches.sh
+            .github/wheel-patches
+          sparse-checkout-cone-mode: false
+
+      - name: Apply wheel patches
+        if: ${{ inputs.apply_patches }}
+        run: .wheel-patch-src/.github/scripts/apply-wheel-patches.sh --target-dir "$GITHUB_WORKSPACE"
+
       - name: Build light core wheel
         env:
           TTLANG_ALLOW_FINAL_INTERNAL_VERSION: ${{ needs.preflight.outputs.allow_final_internal_version }}
-          TTLANG_GIT_COMMIT: ${{ github.sha }}
         run: |
+          # inputs.ttlang_ref may be a tag or branch; record the resolved commit.
+          export TTLANG_GIT_COMMIT="$(git rev-parse HEAD)"
           # Submodules aren't checked out here; read tt-metal's commit from the gitlink.
           export TT_METAL_COMMIT="$(git rev-parse HEAD:third-party/tt-metal)"
           .github/scripts/build-s3-light-core-wheel.sh --python-tag "${{ matrix.python_tag }}" --version "${{ needs.preflight.outputs.version_override }}" --dist-dir dist
@@ -201,6 +236,8 @@ jobs:
     steps:
       - name: Checkout tt-lang
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ttlang_ref || github.sha }}
 
       - name: Download per-ABI wheels
         uses: actions/download-artifact@v8
@@ -247,6 +284,8 @@ jobs:
     steps:
       - name: Checkout tt-lang
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ttlang_ref || github.sha }}
 
       - name: Download bundled wheels
         if: ${{ contains(fromJSON(needs.preflight.outputs.wheel_variants), 'bundled') }}
@@ -295,8 +334,7 @@ jobs:
         if: ${{ needs.preflight.outputs.dry_run != 'true' }}
         run: python3 -m pip install s3pypi
 
-      # Nightly dev wheels (X.Y.Z.devYYYYMMDD) publish under a <YYYY-MM>/ subdir;
-      # stable releases (X.Y.Z) publish at the flat root. Publish layout only.
+      # Nightly dev wheels publish under <YYYY-MM>/; stable releases use root.
       - name: Derive publish prefix
         id: publish_prefix
         run: |
@@ -322,8 +360,7 @@ jobs:
           fi
           .github/scripts/publish-s3-wheels.sh "${publish_args[@]}" dist
 
-      # s3pypi rewrites the index it just wrote on every upload, so restore the
-      # human-facing README onto that index after publishing.
+      # s3pypi rewrites the index on upload; restore the README afterward.
       - name: Inject S3 index README
         if: ${{ needs.preflight.outputs.dry_run != 'true' }}
         run: |
@@ -334,11 +371,7 @@ jobs:
           if [ -n "$prefix" ]; then
             key="$prefix/index.html"
           fi
-          aws s3 cp "s3://tenstorrent-pypi/$key" ./index.html
-          python3 .github/scripts/inject_s3_index_readme.py \
-            packaging/s3-index/README.md ./index.html
-          aws s3 cp ./index.html "s3://tenstorrent-pypi/$key" \
-            --content-type "text/html; charset=utf-8"
+          .github/scripts/inject-s3-index-readme.sh --key "$key" --dist-dir dist
 
       - name: Report install command
         run: |
@@ -355,13 +388,14 @@ jobs:
             "${{ needs.preflight.outputs.wheel_variant }}" \
             "${{ needs.preflight.outputs.version_override }}"
 
-  # Scheduled runs additionally build a per-tt-metal-SHA light wheel. This runs
-  # here (not on its own schedule) so it reuses the ird and manylinux images
-  # this run just pushed; the manylinux images carry no fixed tag to target.
+  # Reuse this run's freshly pushed ird and manylinux images. Best-effort:
+  # continue-on-error here and soft_fail on the reusable build below keep a
+  # failure in this extra wheel from failing the nightly publish.
   ttmetal-light-detect:
     name: "Detect tt-metal uplift for light wheel"
     needs: preflight
     if: ${{ github.event_name == 'schedule' }}
+    continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
@@ -376,11 +410,13 @@ jobs:
     steps:
       - name: Checkout tt-lang
         uses: actions/checkout@v6
-        with:
-          submodules: true
 
       - name: Git safe directory
         run: git config --global --add safe.directory "$(pwd)"
+
+      # Detection needs only tt-mlir's TT_METAL_VERSION pin.
+      - name: Fetch tt-mlir for uplift detection
+        run: git submodule update --init --depth 1 third-party/tt-mlir
 
       - name: Configure AWS Credentials
         uses: ./.github/actions/configure-tt-s3-credentials
@@ -403,3 +439,4 @@ jobs:
       tt_metal_sha: ${{ needs.ttmetal-light-detect.outputs.tt_metal_sha }}
       docker_tag: ${{ needs.preflight.outputs.docker_tag != '' && needs.preflight.outputs.docker_tag || needs.build-docker.outputs.docker-tag }}
       dry_run: false
+      soft_fail: true

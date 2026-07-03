@@ -120,6 +120,20 @@ setup() {
     [ ! -d "$SCRATCH/install" ]
 }
 
+@test "--sha trims workflow-dispatch whitespace" {
+    GITHUB_OUTPUT="$GH_OUT" run -0 "$SCRIPT" --sha "   $SHA   " --scratch-dir "$SCRATCH" --no-build
+
+    run cat "$GH_OUT"
+    assert_output --partial "source_dir=$SCRATCH/src"
+    assert_output --partial "ttmetal_date="
+    # The emitted sha is the trimmed value, not the padded input.
+    assert_output --partial "sha=$SHA"
+    assert_output --partial "short=${SHA:0:7}"
+
+    run git -C "$SCRATCH/src" rev-parse HEAD
+    assert_output "$SHA"
+}
+
 @test "default mode builds and installs, emitting install_dir" {
     GITHUB_OUTPUT="$GH_OUT" run -0 "$SCRIPT" --sha "$SHA" --scratch-dir "$SCRATCH"
 

@@ -36,8 +36,14 @@ CALL_BUILD_WHEEL_IMAGES_WORKFLOW = (
 CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "call-ttmetal-light-wheel.yml"
 )
+CALL_BUILD_WHEELS_WORKFLOW = (
+    REPO_ROOT / ".github" / "workflows" / "call-build-wheels.yml"
+)
 TTMETAL_LIGHT_ON_DEMAND_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "ttmetal-light-on-demand.yml"
+)
+TTMETAL_LIGHT_XLA_ON_DEMAND_WORKFLOW = (
+    REPO_ROOT / ".github" / "workflows" / "ttmetal-light-xla-on-demand.yml"
 )
 MANYLINUX_WHEEL_DOCKERFILE = (
     REPO_ROOT / ".github" / "containers" / "Dockerfile.wheel-manylinux-2-34"
@@ -81,6 +87,10 @@ def test_s3_workflow_routes_light_wheels_to_manylinux_builder() -> None:
     assert ".github/scripts/build-s3-light-core-wheel.sh" in workflow
     assert ".github/scripts/build-s3-light-metapackage-wheel.sh" in workflow
     assert ".github/scripts/test-s3-light-wheels.sh" in workflow
+    assert (
+        '.github/scripts/inject-s3-index-readme.sh --key "$key" --dist-dir dist'
+        in workflow
+    )
     assert "standard_wheel_matrix" in workflow
 
 
@@ -91,7 +101,10 @@ def test_ttmetal_light_workflow_builds_and_validates_metapackage() -> None:
     assert "matrix.python_tag == 'cp312'" not in workflow
     assert "name: ttmetal-light-metapackage" in workflow
     assert "path: dist/tt_lang_light-*.whl" in workflow
-    assert "needs: [find-compatible, build-wheels, build-metapackage]" in workflow
+    assert (
+        "needs: [build-ttmetal, find-compatible, build-wheels, build-metapackage]"
+        in workflow
+    )
     assert (
         "needs: [find-compatible, build-wheels, build-metapackage, device-validate]"
         in workflow
@@ -99,6 +112,36 @@ def test_ttmetal_light_workflow_builds_and_validates_metapackage() -> None:
     assert "metapackage_wheel=$(ls dist/tt_lang_light-*-py3-none-any.whl)" in workflow
     assert "--find-links dist" in workflow
     assert '"$metapackage_wheel"' in workflow
+    assert "tt-lang-setup" in workflow
+    # tt-metal is built once (build-ttmetal, in the oldest-glibc manylinux
+    # container) and the install is shared as an artifact; find-compatible,
+    # build-wheels, and device-validate download it instead of rebuilding.
+    assert "build-ttmetal:" in workflow
+    assert workflow.count(".github/scripts/build-ttmetal-at-sha.sh") == 1
+    assert "tt-lang-wheel-manylinux-2-34-cp312" in workflow
+    # One upload + three downloads of the shared install.
+    assert workflow.count("name: ttmetal-install") == 4
+    assert "TTLANG_EXTERNAL_TT_METAL_DIR: /tmp/ttmetal-install" in workflow
+    assert "TTMETAL_INSTALL_DIR: /tmp/ttmetal-install" in workflow
+    # tar transfer (not a bare artifact) so the sfpi compiler keeps its +x bit;
+    # unpacked by each of the three consumers.
+    assert "Package tt-metal install" in workflow
+    assert workflow.count("--strip-components=1") == 3
+    # Wheel validation is a device smoke -- smoketest plus the tutorials, which
+    # import only ttl and ttnn. The exhaustive test/python and test/me2e
+    # regression runs against the source build, so it is not repeated here, and
+    # the test-tree import shim it needed is gone.
+    assert "test/python/smoketest.py" in workflow
+    assert ".github/scripts/run-tutorials.sh ." in workflow
+    assert "compile-and-run-examples.sh" not in workflow
+    assert "test_import_root" not in workflow
+    assert 'pytest -c /dev/null --rootdir "$PWD" test/python' not in workflow
+    assert 'pytest -c /dev/null --rootdir "$PWD" test/me2e' not in workflow
+    assert "simple_add" not in workflow
+    assert (
+        '.github/scripts/inject-s3-index-readme.sh --key "$key" --dist-dir dist'
+        in workflow
+    )
 
 
 def test_ttmetal_light_max_age_crosses_reusable_workflow_as_string() -> None:
@@ -118,6 +161,148 @@ def test_ttmetal_light_max_age_crosses_reusable_workflow_as_string() -> None:
     )
     assert "type: string" in reusable_max_age
     assert 'default: "14"' in reusable_max_age
+
+
+def test_ttmetal_light_on_demand_detect_skips_s3_for_dry_run() -> None:
+    workflow = TTMETAL_LIGHT_ON_DEMAND_WORKFLOW.read_text()
+    # Dry-run and forced-SHA branch runs do not need S3 credentials.
+    assert "if: ${{ inputs.dry_run != true && inputs.tt_metal_sha == '' }}" in workflow
+    assert "detect-ttmlir-ttmetal-uplift.sh --assume-new" in workflow
+    assert 'forced_sha="$(printf \'%s\' "$FORCED_SHA"' in workflow
+    assert 'echo "tt_metal_sha=$forced_sha" >> "$GITHUB_OUTPUT"' in workflow
+
+
+def test_ttmetal_light_on_demand_detect_avoids_full_submodule_clone() -> None:
+    workflow = TTMETAL_LIGHT_ON_DEMAND_WORKFLOW.read_text()
+    # The detect job needs tt-mlir only; llvm-project and tt-metal are unused.
+    assert "submodules: true" not in workflow
+    assert "git submodule update --init --depth 1 third-party/tt-mlir" in workflow
+    assert "if: ${{ inputs.tt_metal_sha == '' }}" in workflow
+
+
+def test_ttlang_ref_threads_from_on_demand_to_reusable_workflow() -> None:
+    on_demand = TTMETAL_LIGHT_ON_DEMAND_WORKFLOW.read_text()
+    reusable = CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW.read_text()
+    # The on-demand input is declared and passed through to the reusable build.
+    assert "ttlang_ref:" in on_demand
+    assert "ttlang_ref: ${{ inputs.ttlang_ref }}" in on_demand
+    assert "ttlang_ref:" in reusable
+
+
+def test_pinned_ttlang_ref_skips_search_and_tt_metal_build() -> None:
+    reusable = CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW.read_text()
+    # A pinned ref is checked out directly, falling back to the trigger commit
+    # in search mode, and drives the build.
+    assert "ref: ${{ inputs.ttlang_ref || github.sha }}" in reusable
+    # The tt-metal build (the search's device gate) is skipped when pinning.
+    assert "if: ${{ inputs.ttlang_ref == '' }}" in reusable
+    # The pin path emits the winner without the compatibility search.
+    assert "python3 .github/scripts/compute-nightly-version.py" in reusable
+    assert 'winner_sha="$(git rev-parse HEAD)"' in reusable
+
+
+def test_publish_s3_supports_pinned_ref_and_wheel_patches() -> None:
+    workflow = PUBLISH_S3_PYPI_WORKFLOW.read_text()
+    # Dispatch inputs to rebuild from a pinned ref and optionally patch it.
+    assert "ttlang_ref:" in workflow
+    assert "apply_patches:" in workflow
+    # Direct checkouts honor the pinned ref, falling back to the trigger commit.
+    assert "ref: ${{ inputs.ttlang_ref || github.sha }}" in workflow
+    # The override threads to the build reusables under their own input name.
+    assert "ttlang_sha_override: ${{ inputs.ttlang_ref }}" in workflow
+    # Patches come from the workflow commit (a checkout of github.sha), not the
+    # target ref -- an older ref that needs a patch predates the patch files.
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "path: .wheel-patch-src" in workflow
+    assert (
+        ".wheel-patch-src/.github/scripts/apply-wheel-patches.sh"
+        ' --target-dir "$GITHUB_WORKSPACE"'
+    ) in workflow
+    # TTLANG_GIT_COMMIT records the resolved commit, not a tag/branch name.
+    assert 'export TTLANG_GIT_COMMIT="$(git rev-parse HEAD)"' in workflow
+    assert "TTLANG_GIT_COMMIT: ${{ inputs.ttlang_ref" not in workflow
+    # apply_patches stays a valid boolean on push/schedule (no dispatch inputs).
+    assert (
+        "apply_patches: ${{ github.event_name == 'workflow_dispatch'"
+        " && inputs.apply_patches }}"
+    ) in workflow
+
+
+def test_call_build_wheels_supports_pinned_ref_and_patches() -> None:
+    workflow = CALL_BUILD_WHEELS_WORKFLOW.read_text()
+    assert "ttlang_sha_override:" in workflow
+    assert "apply_patches:" in workflow
+    assert "ref: ${{ inputs.ttlang_sha_override || github.sha }}" in workflow
+    # Patches are sourced from the workflow commit and applied to the target tree.
+    assert "path: .wheel-patch-src" in workflow
+    assert (
+        ".wheel-patch-src/.github/scripts/apply-wheel-patches.sh"
+        ' --target-dir "$GITHUB_WORKSPACE"'
+    ) in workflow
+
+
+def test_on_demand_requires_tt_metal_sha_when_ttlang_ref_pinned() -> None:
+    workflow = TTMETAL_LIGHT_ON_DEMAND_WORKFLOW.read_text()
+    # Auto-detect reads the dispatch ref's tt-metal pin, so a pinned tt-lang ref
+    # without an explicit tt_metal_sha would target the wrong tt-metal -- reject it.
+    assert 'if [ -n "$TTLANG_REF" ] && [ -z "$forced_sha" ]; then' in workflow
+    assert "TTLANG_REF: ${{ inputs.ttlang_ref }}" in workflow
+
+
+def test_nightly_light_wheel_soft_fails_without_failing_publish() -> None:
+    publish = PUBLISH_S3_PYPI_WORKFLOW.read_text()
+    reusable = CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW.read_text()
+    # The scheduled detect job tolerates its own failure, and the reusable
+    # build it feeds is invoked in soft-fail mode.
+    assert "continue-on-error: true" in publish
+    assert "soft_fail: true" in publish
+    # Every job in the reusable build honors soft_fail (caller-level
+    # continue-on-error is not valid on a reusable-workflow job).
+    assert "soft_fail:" in reusable
+    assert reusable.count("continue-on-error: ${{ inputs.soft_fail }}") == 7
+
+
+def test_ttmetal_light_xla_workflow_uses_ubuntu_external_builder() -> None:
+    workflow = TTMETAL_LIGHT_XLA_ON_DEMAND_WORKFLOW.read_text()
+
+    assert "ttlang_ref:" in workflow
+    assert "tt_metal_sha:" in workflow
+    assert "required: true" in workflow
+    assert "resolve-xla-build-inputs.sh" in workflow
+    assert "Leave empty to resolve it from ttlang_ref." in workflow
+    assert (
+        "tt-lang-ird-ubuntu-24-04:${{ needs.resolve.outputs.docker_tag }}" in workflow
+    )
+    assert ".github/scripts/build-ttmetal-at-sha.sh" in workflow
+    assert "--scratch-dir /tmp/ttmetal-xla-sha" in workflow
+    assert "TTNN_DEP_MODE: external" in workflow
+    assert "TTLANG_TTNN_DEP_MODE: external" in workflow
+    assert (
+        "TTLANG_EXTERNAL_TT_METAL_DIR: ${{ steps.ttmetal.outputs.install_dir }}"
+        in workflow
+    )
+    assert "TT_METAL_COMMIT: ${{ steps.ttmetal.outputs.sha }}" in workflow
+    assert "pip wheel . --wheel-dir=dist-raw --no-deps --no-build-isolation" in workflow
+    # Standard tt-lang-light wheels: no name/version suffix mechanism at all.
+    assert "EXTERNAL_WHEEL_SUFFIX" not in workflow
+    assert "--package-suffix" not in workflow
+    assert "light.xla" not in workflow
+    # XLA is distinguished by the dist/xla/<ttmetal7> location, not the wheel name.
+    assert "dist/xla/${{ steps.ttmetal.outputs.short }}" in workflow
+    assert "tt-lang-light-xla-wheels" in workflow
+    # The wheel is device-validated against the same tt-metal SHA it was built on.
+    assert "Device-validate XLA light wheel" in workflow
+    assert "options: --device /dev/tenstorrent" in workflow
+    assert "bash .github/scripts/run-tutorials.sh ." in workflow
+    # tt-metal built once (build job), shared as a tar artifact preserving the
+    # sfpi +x bit; device-validate downloads and unpacks it, not rebuilds.
+    assert "Package tt-metal install" in workflow
+    assert workflow.count("name: ttmetal-install") == 2
+    assert "TTMETAL_INSTALL_DIR: /tmp/ttmetal-install" in workflow
+    assert "--strip-components=1" in workflow
+    assert "tt-lang-wheel-manylinux-2-34" not in workflow
+    assert "build-s3-light-core-wheel.sh" not in workflow
+    assert "build-s3-light-metapackage-wheel.sh" not in workflow
 
 
 def test_manylinux_builder_images_are_opt_in_for_docker_workflows() -> None:

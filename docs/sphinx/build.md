@@ -650,6 +650,66 @@ mode-specific artifacts, verifies each artifact with the expected version rules,
 then publishes a single combined directory. The light build does not emit
 `tt-lang-sim`; bundled/public wheel builds keep producing the simulator wheel.
 
+To rebuild a light wheel from a specific older tt-lang commit or tag -- for
+example to reissue a release line whose original wheel no longer runs -- dispatch
+the workflow with a pinned ref, adding wheel patches when that ref's pinned
+dependencies no longer resolve:
+
+```text
+wheel_variant: light
+version_override: <internal-version>
+ttlang_ref: <tt-lang SHA or tag>
+apply_patches: true
+```
+
+`ttlang_ref` checks out that commit or tag for every wheel-building job instead
+of the triggering commit. `apply_patches` runs the scripts in
+`.github/wheel-patches/` against the checkout before building; the first patch
+rewrites a stale `numpy` pin to the current line's constraint so an older ref
+installs cleanly. The patch runner and the patches are taken from the workflow
+commit, not the pinned ref, so a ref that predates them is still patched.
+
+#### Building a light wheel for a specific tt-metal SHA
+
+`ttmetal-light-on-demand.yml` builds and device-tests a light wheel against an
+arbitrary tt-metal commit. Dispatch it with a `tt_metal_sha`; leave `ttlang_ref`
+empty to search for the newest compatible tt-lang commit, or set it to pin the
+tt-lang commit or tag to build. A pinned `ttlang_ref` requires `tt_metal_sha`,
+because auto-detection reads the dispatch ref's tt-mlir pin rather than the
+pinned ref's. With `dry_run: true` the workflow builds and validates without
+publishing and needs no S3 credentials, so it can run from a feature branch; the
+scheduled per-tt-metal-SHA build in `publish-s3-pypi.yml` is best-effort and does
+not fail the nightly publish.
+
+`ttmetal-light-xla-on-demand.yml` builds standard `tt-lang-light` wheels for the
+XLA flow from a specific tt-lang ref and tt-metal SHA. Dispatch it with:
+
+```text
+ttlang_ref: <tt-lang SHA or tag>
+tt_metal_sha: <tt-metal SHA>
+```
+
+Leave `docker_tag` and `version_override` empty to resolve them from the pinned
+`ttlang_ref`; the resolver runs that checkout's `get-version-tag.sh` and
+`compute-nightly-version.py` so the build uses the matching IRD image and wheel
+version for the selected tt-lang ref. Set `apply_patches: true` when the pinned
+ref needs the workflow commit's wheel patches. Set `hw_type` to select a device
+validation runner type; it defaults to `n150`.
+
+The XLA workflow uses the Ubuntu IRD image directly, builds the requested
+tt-metal SHA with `.github/scripts/build-ttmetal-at-sha.sh`, and builds the
+tt-lang wheel in `TTLANG_TTNN_DEP_MODE=external` mode. The wheels keep the
+standard package names and versions: `tt-lang==<version>+light` and
+`tt-lang-light==<version>`. The XLA distinction is the index location, not a
+wheel suffix: the build places both wheels under `dist/xla/<ttmetal7>/` and
+uploads that wheel set as the `tt-lang-light-xla-wheels` artifact. It does not
+use the manylinux_2_34 light-wheel builder or publish to S3.
+
+The workflow device-validates the uploaded wheels in a separate hardware job.
+That job rebuilds tt-metal at the same `tt_metal_sha`, installs the downloaded
+`tt-lang-light` wheel with the external tt-metal environment, then runs
+`test/python/smoketest.py` and the tutorial suite.
+
 #### Local internal wheel testing
 
 Use the same environment variables as the reusable workflow when validating the
