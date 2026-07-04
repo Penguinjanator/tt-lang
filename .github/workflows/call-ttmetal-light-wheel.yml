@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build, device-test, and publish a tt-lang-light wheel for a tt-metal SHA.
-# The S3 prefix is the tt-metal short SHA, so wheel filenames stay unchanged.
+# The per-SHA S3 location is tt-lang/<tt-metal-short-SHA>/, so wheel filenames
+# stay unchanged and light/normal wheels live in the same find-links directory.
 
-name: tt-lang-light wheel for a tt-metal SHA
+name: Build tt-lang-light per-tt-metal-SHA wheel (reusable)
 
 on:
   workflow_call:
@@ -25,7 +26,7 @@ on:
         type: string
         default: "14"
       python_tags:
-        description: "Comma-separated CPython ABIs to build (subset of cp310,cp312)."
+        description: "Comma-separated CPython ABIs to build (subset of cp310,cp312; must include cp312 for device validation)."
         required: false
         type: string
         default: "cp310,cp312"
@@ -55,8 +56,45 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: "Validate tt-lang-light per-tt-metal-SHA inputs"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      python_tags: ${{ steps.python_tags.outputs.python_tags }}
+    steps:
+      - name: Checkout tt-lang
+        uses: actions/checkout@v6
+
+      - name: Require main ref for S3 publishing
+        if: ${{ inputs.dry_run != true && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "S3 publishing is restricted to refs/heads/main (got ${GITHUB_REF}). Set dry_run=true for non-main validation." >&2
+          exit 1
+
+      - name: Validate Python ABI tags
+        id: python_tags
+        env:
+          PYTHON_TAGS: ${{ inputs.python_tags }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/lib/docker-image-utils.sh
+          python_tags="$(ttlang_python_tags "$PYTHON_TAGS" | paste -sd, -)"
+          if [[ ",$python_tags," != *,cp312,* ]]; then
+            echo "python_tags must include cp312 because device validation runs under the cp312 IRD environment." >&2
+            exit 1
+          fi
+          echo "python_tags=$python_tags" >> "$GITHUB_OUTPUT"
+          echo "Python ABI tags: $python_tags"
+
   build-ttmetal:
     name: "Build tt-metal at SHA"
+    needs: preflight
     continue-on-error: ${{ inputs.soft_fail }}
     runs-on: mlir-large-runner-lang
     timeout-minutes: 180
@@ -71,6 +109,7 @@ jobs:
       contents: read
       packages: read
     outputs:
+      ttmetal_sha: ${{ steps.ttmetal.outputs.sha }}
       ttmetal_short: ${{ steps.ttmetal.outputs.short }}
       ttmetal_date: ${{ steps.ttmetal.outputs.ttmetal_date }}
     steps:
@@ -130,6 +169,7 @@ jobs:
       found: ${{ steps.search.outputs.found }}
       winner_sha: ${{ steps.search.outputs.winner_sha }}
       winner_version: ${{ steps.search.outputs.winner_version }}
+      ttmetal_sha: ${{ needs.build-ttmetal.outputs.ttmetal_sha }}
       ttmetal_short: ${{ needs.build-ttmetal.outputs.ttmetal_short }}
       ttlang_head: ${{ steps.head.outputs.sha }}
     steps:
@@ -166,6 +206,7 @@ jobs:
         id: search
         env:
           TTLANG_REF: ${{ inputs.ttlang_ref }}
+          TT_METAL_COMMIT: ${{ needs.build-ttmetal.outputs.ttmetal_sha }}
         run: |
           set -euo pipefail
           if [ -n "$TTLANG_REF" ]; then
@@ -189,7 +230,7 @@ jobs:
     name: "Record no-compatible miss"
     continue-on-error: ${{ inputs.soft_fail }}
     needs: find-compatible
-    if: ${{ needs.find-compatible.outputs.found == 'false' && inputs.dry_run != true }}
+    if: ${{ needs.find-compatible.outputs.found == 'false' && inputs.dry_run != true && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
@@ -216,7 +257,7 @@ jobs:
   build-wheels:
     name: "Build light wheel (${{ matrix.python_tag }})"
     continue-on-error: ${{ inputs.soft_fail }}
-    needs: [build-ttmetal, find-compatible]
+    needs: [preflight, build-ttmetal, find-compatible]
     if: ${{ needs.find-compatible.outputs.found == 'true' }}
     runs-on: mlir-large-runner-lang
     timeout-minutes: 180
@@ -236,7 +277,7 @@ jobs:
       - name: Skip unrequested ABI
         id: gate
         env:
-          PYTHON_TAGS: ${{ inputs.python_tags }}
+          PYTHON_TAGS: ${{ needs.preflight.outputs.python_tags }}
           ABI: ${{ matrix.python_tag }}
         run: |
           python_tags="$(printf '%s' "$PYTHON_TAGS" | tr -d '[:space:]')"
@@ -277,6 +318,7 @@ jobs:
         env:
           TTLANG_EXTERNAL_TT_METAL_DIR: /tmp/ttmetal-install
           TTLANG_GIT_COMMIT: ${{ needs.find-compatible.outputs.winner_sha }}
+          TT_METAL_COMMIT: ${{ needs.find-compatible.outputs.ttmetal_sha }}
         run: |
           .github/scripts/build-s3-light-core-wheel.sh \
             --python-tag "${{ matrix.python_tag }}" \
@@ -385,6 +427,7 @@ jobs:
       - name: Install light wheel and external tt-metal
         env:
           TTMETAL_INSTALL_DIR: /tmp/ttmetal-install
+          EXPECTED_TT_METAL_COMMIT: ${{ needs.find-compatible.outputs.ttmetal_sha }}
         run: |
           set -euo pipefail
           # Clean venv (no --system-site-packages): the installed light wheel and
@@ -404,6 +447,17 @@ jobs:
           tt-lang-setup
           pip install -r dev-requirements.txt
           eval "$(tt-lang-setup-external-tt-metal --tt-metal-dir "$TTMETAL_INSTALL_DIR")"
+          python3 - <<'PY'
+          import os
+          import ttl
+
+          expected = os.environ["EXPECTED_TT_METAL_COMMIT"]
+          actual = ttl.build_info()["tt_metal"]
+          if actual != expected:
+              raise SystemExit(
+                  f"tt-lang wheel tt-metal provenance mismatch: expected {expected}, got {actual}"
+              )
+          PY
           echo "TTL_EXTERNAL_TT_METAL_DIR=$TTMETAL_INSTALL_DIR" >> "$GITHUB_ENV"
 
       - name: Device suite
@@ -422,10 +476,10 @@ jobs:
           bash .github/scripts/run-tutorials.sh .
 
   publish:
-    name: "Publish to S3 under per-SHA prefix"
+    name: "Publish to S3 under tt-lang/<SHA> prefix"
     continue-on-error: ${{ inputs.soft_fail }}
-    needs: [find-compatible, build-wheels, build-metapackage, device-validate]
-    if: ${{ needs.find-compatible.outputs.found == 'true' && inputs.dry_run != true }}
+    needs: [preflight, find-compatible, build-wheels, build-metapackage, device-validate]
+    if: ${{ needs.find-compatible.outputs.found == 'true' && inputs.dry_run != true && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -448,6 +502,7 @@ jobs:
       - name: Prepare publish dist
         run: |
           .github/scripts/prepare-s3-publish-dist.sh \
+            --light-python-tags "${{ needs.preflight.outputs.python_tags }}" \
             "${{ needs.find-compatible.outputs.winner_version }}" \
             dist \
             light:no-sim=wheel-artifacts/light
@@ -455,23 +510,14 @@ jobs:
       - name: Configure AWS Credentials
         uses: ./.github/actions/configure-tt-s3-credentials
 
-      - name: Install s3pypi
-        run: python3 -m pip install s3pypi markdown
-
       - name: Publish wheels
         run: |
-          .github/scripts/publish-s3-wheels.sh --overwrite \
-            --prefix "${{ needs.find-compatible.outputs.ttmetal_short }}" dist
-
-      - name: Inject S3 index README
-        run: |
-          set -euo pipefail
-          key="${{ needs.find-compatible.outputs.ttmetal_short }}/index.html"
-          .github/scripts/inject-s3-index-readme.sh --key "$key" --dist-dir dist
+          .github/scripts/publish-s3-direct-wheels.sh \
+            --prefix "tt-lang/${{ needs.find-compatible.outputs.ttmetal_short }}" dist
 
       - name: Report install command
         run: |
           .github/scripts/publish-s3-summary.sh \
-            --index-subdir "${{ needs.find-compatible.outputs.ttmetal_short }}" \
+            --find-links-subdir "tt-lang/${{ needs.find-compatible.outputs.ttmetal_short }}" \
             light \
             "${{ needs.find-compatible.outputs.winner_version }}"
