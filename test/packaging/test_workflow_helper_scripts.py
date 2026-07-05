@@ -37,6 +37,8 @@ CALL_BUILD_WHEEL_IMAGES_WORKFLOW = (
 CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "call-ttmetal-light-wheel.yml"
 )
+DETECT_TTMLIR_TTMETAL_UPLIFT = SCRIPTS_DIR / "detect-ttmlir-ttmetal-uplift.sh"
+RECORD_TTMETAL_MISS = SCRIPTS_DIR / "record-ttmetal-miss.sh"
 CALL_BUILD_WHEELS_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "call-build-wheels.yml"
 )
@@ -46,6 +48,7 @@ TTMETAL_LIGHT_ON_DEMAND_WORKFLOW = (
 TTMETAL_LIGHT_XLA_ON_DEMAND_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "ttmetal-light-xla-on-demand.yml"
 )
+S3_PYPI_OPS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "s3-pypi-ops.yml"
 MANYLINUX_WHEEL_DOCKERFILE = (
     REPO_ROOT / ".github" / "containers" / "Dockerfile.wheel-manylinux-2-34"
 )
@@ -98,6 +101,19 @@ def test_s3_workflow_routes_light_wheels_to_manylinux_builder() -> None:
         in workflow
     )
     assert "standard_wheel_matrix" in workflow
+
+
+def test_nightly_publish_prefix_is_under_tt_lang() -> None:
+    workflow = PUBLISH_S3_PYPI_WORKFLOW.read_text()
+    assert 'prefix="tt-lang/${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"' in workflow
+
+
+def test_prefixed_index_injection_targets_the_slash_key() -> None:
+    # s3pypi writes a prefixed root index to the slash-key "<prefix>/", not
+    # "<prefix>/index.html"; the injection step must upload to the same key.
+    workflow = PUBLISH_S3_PYPI_WORKFLOW.read_text()
+    assert 'key="$prefix/"' in workflow
+    assert 'key="$prefix/index.html"' not in workflow
 
 
 def test_ttmetal_light_workflow_builds_and_validates_metapackage() -> None:
@@ -174,14 +190,33 @@ def test_ttmetal_light_workflow_builds_and_validates_metapackage() -> None:
     assert (
         '--light-python-tags "${{ needs.preflight.outputs.python_tags }}"' in workflow
     )
-    assert '--prefix "tt-lang/${{ needs.find-compatible.outputs.ttmetal_short }}"' in (
-        workflow
+    assert (
+        '--prefix "tt-lang/ttmetal/${{ needs.find-compatible.outputs.ttmetal_short }}"'
+        in (workflow)
     )
     assert (
-        '--find-links-subdir "tt-lang/${{ needs.find-compatible.outputs.ttmetal_short }}"'
+        '--find-links-subdir "tt-lang/ttmetal/${{ needs.find-compatible.outputs.ttmetal_short }}"'
         in workflow
     )
     assert "Inject S3 index README" not in workflow
+
+
+def test_per_sha_prefix_is_consistent_across_publish_detect_record() -> None:
+    detect_script = DETECT_TTMLIR_TTMETAL_UPLIFT.read_text()
+    record_script = RECORD_TTMETAL_MISS.read_text()
+    workflow = CALL_TTMETAL_LIGHT_WHEEL_WORKFLOW.read_text()
+
+    assert "tt-lang/ttmetal/" in detect_script
+    assert "tt-lang/ttmetal/" in record_script
+    assert "tt-lang/ttmetal/" in workflow
+
+    old_forms = (
+        "s3://$S3_BUCKET/tt-lang/$1/",
+        "s3://$S3_BUCKET/tt-lang/$short/attempt.json",
+    )
+    for script_text in (detect_script, record_script):
+        for old_form in old_forms:
+            assert old_form not in script_text
 
 
 def test_ttmetal_light_workflow_names_are_specific() -> None:
@@ -389,6 +424,26 @@ def test_ttmetal_light_xla_workflow_uses_ubuntu_external_builder() -> None:
         "EXPECTED_TT_METAL_COMMIT: ${{ needs.build.outputs.ttmetal_sha }}" in workflow
     )
     assert "EXPECTED_TT_METAL_COMMIT: ${{ inputs.tt_metal_sha }}" not in workflow
+
+
+def test_s3_pypi_ops_workflow_is_main_gated_and_dry_run_by_default() -> None:
+    workflow = S3_PYPI_OPS_WORKFLOW.read_text()
+
+    assert "name: S3 PyPI ops (tt-lang)" in workflow
+    assert "options: [inspect, put-index, move, copy, delete, readonly-cmd]" in workflow
+    assert "id-token: write" in workflow
+    assert "uses: ./.github/actions/configure-tt-s3-credentials" in workflow
+    # Creds are configured only on main, so a non-main run never assumes the
+    # shared-bucket role, for any operation (read or write, dry-run or not).
+    assert "if: ${{ github.ref == 'refs/heads/main' }}" in workflow
+    assert (
+        "if: ${{ inputs.dry_run != true && github.ref != 'refs/heads/main' }}"
+        in workflow
+    )
+    assert ".github/scripts/s3-pypi-ops.sh" in workflow
+    # dry_run input defaults to true
+    dry_run_input = workflow.split("      dry_run:", 1)[1].split("concurrency:", 1)[0]
+    assert "default: true" in dry_run_input
 
 
 def test_light_core_builder_checks_tt_metal_provenance_when_exported() -> None:

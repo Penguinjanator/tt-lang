@@ -59,10 +59,12 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 index_html="$tmpdir/index.html"
-aws_error="$tmpdir/aws-cp.err"
+aws_error="$tmpdir/aws-get.err"
 
-if ! aws s3 cp "s3://$bucket/$key" "$index_html" 2>"$aws_error"; then
-    if grep -Eq 'HeadObject.*404|404.*HeadObject|Key ".+" does not exist' "$aws_error"; then
+# The key may end in "/" (s3pypi's prefixed root index is a slash-key); s3api
+# uses the exact key, whereas `s3 cp` treats a trailing slash as a directory.
+if ! aws s3api get-object --bucket "$bucket" --key "$key" "$index_html" >/dev/null 2>"$aws_error"; then
+    if grep -Eq 'NoSuchKey|Not Found|404|does not exist' "$aws_error"; then
         echo "S3 index s3://$bucket/$key does not exist; creating a root index from $dist_dir." >&2
         rm -f "$index_html"
     else
@@ -75,5 +77,5 @@ python3 .github/scripts/inject_s3_index_readme.py \
     --create-from-dist "$dist_dir" \
     "$readme" \
     "$index_html"
-aws s3 cp "$index_html" "s3://$bucket/$key" \
-    --content-type "text/html; charset=utf-8"
+aws s3api put-object --bucket "$bucket" --key "$key" --body "$index_html" \
+    --content-type "text/html; charset=utf-8" >/dev/null
