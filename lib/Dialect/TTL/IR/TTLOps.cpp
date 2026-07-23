@@ -6,6 +6,7 @@
 #include "ttlang/Dialect/TTL/IR/TTLOpsTypes.h"
 
 #include "TTLOpsVerifyUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineMap.h"
@@ -18,6 +19,7 @@
 #include "ttlang/Dialect/TTL/IR/TTLOpsAttrs.h" // IWYU pragma: keep
 #include "ttlang/Dialect/TTL/IR/TTLOpsEnums.h" // IWYU pragma: keep
 #include "ttlang/Dialect/TTL/IR/TTLOpsUtils.h"
+#include "ttlang/Dialect/Utils/OpaqueCallVerifyUtils.h"
 #include "llvm/ADT/TypeSwitch.h" // IWYU pragma: keep
 #include <cstdint>
 #include <functional>
@@ -1971,4 +1973,9 @@ void mlir::tt::ttl::PipeNetScopeOp::getSuccessorRegions(
     return;
   }
   regions.push_back(RegionSuccessor(getOperation()));
+}
+
+mlir::LogicalResult mlir::tt::ttl::OpaqueCallOp::verify() {
+  return mlir::tt::utils::verifyOpaqueCall<GetDfbIdOp>(
+      getOperation(), getCallee(), getHeader(), getTemplateArgVals());
 }
