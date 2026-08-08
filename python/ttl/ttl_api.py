@@ -56,6 +56,7 @@ from ttl.passes import (
     get_ttkernel_names,
     ttkernel_to_cpp_by_name,
 )
+
 from ttl.passmanager import PassManager
 
 
@@ -85,7 +86,7 @@ from .dataflow_buffer import (
     get_cb_count,
 )
 from .pipe import Pipe, PipeNet
-from .constants import SUPPORTED_MEMORY_SPACES
+from .constants import SUPPORTED_MEMORY_SPACES, validate_math_fidelity
 from .diagnostics import (
     TTLangCompileError,
     find_variable_assignment,
@@ -105,6 +106,11 @@ from .kernel_runner import (
 from .operators import CopyTransferHandler, TensorBlock, copy
 from .compiler_options import CompilerOptions
 from .ttl_utils import get_thread_type_string
+
+_TTCORE_ARCH_BY_DEVICE_NAME = {
+    "blackhole": ttcore.Arch.Blackhole,
+    "wormhole_b0": ttcore.Arch.WormholeB0,
+}
 
 # Thread registry for automatic collection of @compute and @datamovement threads
 _thread_registry: List[Callable] = []
@@ -155,6 +161,7 @@ def _make_cache_key(
     resolved_grid: Union[tuple, List[int]],
     fp32_dest_acc_en: Optional[bool],
     dst_full_sync_en: Optional[bool],
+    math_fidelity: Optional[str],
     target_arch: Optional[str],
     compiler_options: CompilerOptions = CompilerOptions(),
 ) -> tuple:
@@ -182,6 +189,7 @@ def _make_cache_key(
         grid_key,
         fp32_dest_acc_en,
         dst_full_sync_en,
+        math_fidelity,
         target_arch,
         compiler_options,
     )
@@ -482,18 +490,32 @@ def _detect_device_arch(device) -> Optional[str]:
 
 
 def _device_target_arch(args) -> Optional[str]:
-    """Return the first detected tensor device architecture, or None."""
+    """Return the common tensor device architecture, or None for host inputs."""
+    target_arch = None
     for arg in args:
-        if not is_ttnn_tensor(arg) or not hasattr(arg, "device"):
+        if not is_ttnn_tensor(arg):
             continue
-        device = arg.device()
+        try:
+            device = arg.device()
+        except Exception as error:
+            raise ValueError(
+                "Unsupported or undetectable TT device architecture"
+            ) from error
         if device is None:
             continue
         arch = _detect_device_arch(device)
         if arch is None:
-            continue
-        return arch
-    return None
+            raise ValueError("Unsupported or undetectable TT device architecture")
+        if arch not in _TTCORE_ARCH_BY_DEVICE_NAME:
+            raise ValueError(f"Unsupported TT device architecture: {arch}")
+        if target_arch is None:
+            target_arch = arch
+        elif target_arch != arch:
+            raise ValueError(
+                "Tensor arguments use different TT device architectures: "
+                f"{target_arch} and {arch}"
+            )
+    return target_arch
 
 
 def _resolve_grid(grid, args, kwargs):
@@ -756,12 +778,24 @@ def _set_unpack_to_dest_fp32(config, ttnn_mod, cb_indices) -> None:
         )
 
 
+def _set_math_fidelity(config, ttnn_mod, math_fidelity: str) -> None:
+    try:
+        config.math_fidelity = getattr(ttnn_mod.MathFidelity, math_fidelity)
+    except AttributeError as error:
+        raise RuntimeError(
+            f"TTNN does not provide MathFidelity.{math_fidelity}"
+        ) from error
+
+
 def _get_kernel_bool_attr(module, kernel_name: str, attr_name: str) -> bool:
     """Read a boolean func.func attribute from a compiled kernel."""
     operation = _lookup_kernel_func_op(module, kernel_name)
     attr = operation.attributes.get(attr_name, None)
     if attr is None:
-        return False
+        raise ValueError(
+            f"Required compiler-generated attribute '{attr_name}' is missing "
+            f"from compute kernel '{kernel_name}'"
+        )
     attr_text = str(attr).strip()
     if attr_text == "true":
         return True
@@ -774,10 +808,24 @@ def _get_kernel_bool_attr(module, kernel_name: str, attr_name: str) -> bool:
 
 
 def _get_kernel_i32_array_attr(module, kernel_name: str, attr_name: str):
-    """Read a `DenseI32ArrayAttr` func.func attribute as a list of ints.
+    """Read a required `DenseI32ArrayAttr` kernel attribute."""
+    operation = _lookup_kernel_func_op(module, kernel_name)
+    attr = operation.attributes.get(attr_name, None)
+    if attr is None:
+        raise ValueError(
+            f"Required compiler-generated attribute '{attr_name}' is missing "
+            f"from compute kernel '{kernel_name}'"
+        )
+    if not isinstance(attr, DenseI32ArrayAttr):
+        raise ValueError(
+            f"Expected DenseI32ArrayAttr for '{attr_name}' on kernel "
+            f"'{kernel_name}', got {attr}"
+        )
+    return list(attr)
 
-    Returns an empty list when the attribute is missing.
-    """
+
+def _get_optional_kernel_i32_array_attr(module, kernel_name: str, attr_name: str):
+    """Read an optional `DenseI32ArrayAttr` kernel attribute."""
     operation = _lookup_kernel_func_op(module, kernel_name)
     attr = operation.attributes.get(attr_name, None)
     if attr is None:
@@ -865,6 +913,7 @@ def _compile_ttnn_kernel(
     program_hash=None,
     fp32_dest_acc_en: Optional[bool] = None,
     dst_full_sync_en: Optional[bool] = None,
+    math_fidelity: Optional[str] = None,
     verbose=True,
     source_lines=None,
     all_source_lines=None,
@@ -1000,7 +1049,8 @@ def _compile_ttnn_kernel(
                 module, name, "ttl.unpack_to_dest_fp32"
             ),
         }
-        for name, _ in kernel_info
+        for name, thread_type in kernel_info
+        if thread_type == "compute"
     }
 
     # Build thread-to-kernel mapping for profiling
@@ -1012,7 +1062,7 @@ def _compile_ttnn_kernel(
         kernel_path = _write_kernel_to_tmp(name, cpp_source)
         kernel_paths.append((kernel_path, thread_type))
         kernel_pipe_computed_address_dfb_indices.append(
-            _get_kernel_i32_array_attr(
+            _get_optional_kernel_i32_array_attr(
                 module, name, _ttl_ir.PIPE_COMPUTED_ADDRESS_DFB_INDICES_ATTR
             )
         )
@@ -1023,6 +1073,8 @@ def _compile_ttnn_kernel(
 
         if thread_type == "compute":
             config = ttnn.ComputeConfigDescriptor()
+            if math_fidelity is not None:
+                _set_math_fidelity(config, ttnn, math_fidelity)
             if fp32_dest_acc_en is not None:
                 config.fp32_dest_acc_en = fp32_dest_acc_en
             elif kernel_config_attrs[name]["fp32_dest_acc_en"]:
@@ -1677,6 +1729,7 @@ def _compile_kernel(
     program_hash: int,
     fp32_dest_acc_en: Optional[bool] = None,
     dst_full_sync_en: Optional[bool] = None,
+    math_fidelity: Optional[str] = None,
     target_arch: Optional[str] = None,
     compiler_options: CompilerOptions = CompilerOptions(),
 ) -> Optional[CompiledTTNNKernel]:
@@ -1696,6 +1749,7 @@ def _compile_kernel(
         program_hash: Hash for tt-metal program cache
         fp32_dest_acc_en: Optional override for fp32_dest_acc_en
         dst_full_sync_en: Optional override for dst_full_sync_en
+        math_fidelity: Optional TTNN compute math fidelity
         target_arch: Optional TT device architecture for target-specific lowering
         compiler_options: Compiler pipeline options
 
@@ -1801,6 +1855,7 @@ def _compile_kernel(
         target_arch=target_arch,
         fp32_dest_acc_en=fp32_dest_acc_en,
         dst_full_sync_en=dst_full_sync_en,
+        math_fidelity=math_fidelity,
         compiler_options=compiler_options,
         program_hash=program_hash,
         l1_budget_override=l1_budget_override,
@@ -1819,6 +1874,7 @@ def _lower_program_to_kernel(
     target_arch,
     fp32_dest_acc_en,
     dst_full_sync_en,
+    math_fidelity,
     compiler_options,
     program_hash,
     l1_budget_override,
@@ -1908,7 +1964,9 @@ def _lower_program_to_kernel(
             ctx,
         )
         if target_arch is not None:
-            module.operation.attributes["ttl.target_arch"] = StringAttr.get(target_arch)
+            module.operation.attributes["ttl.target_arch"] = ttcore.ir.ArchAttr.get(
+                ctx, int(_TTCORE_ARCH_BY_DEVICE_NAME[target_arch])
+            )
 
         # Insert standalone thread functions directly into module
         with InsertionPoint(module.body):
@@ -1933,11 +1991,13 @@ def _lower_program_to_kernel(
         config_options = []
         if fp32_dest_acc_en is not None:
             config_options.append(
-                f"fp32-dest-acc-en={1 if fp32_dest_acc_en else 0}"
+                "fp32-dest-acc-en="
+                + ("enabled" if fp32_dest_acc_en else "disabled")
             )
         if dst_full_sync_en is not None:
             config_options.append(
-                f"dst-full-sync-en={1 if dst_full_sync_en else 0}"
+                "dst-full-sync-en="
+                + ("enabled" if dst_full_sync_en else "disabled")
             )
         config_options.append(
             f"reduce-full-fp32={int(compiler_options.reduce_full_fp32)}"
@@ -2148,6 +2208,7 @@ def _lower_program_to_kernel(
             program_hash=program_hash,
             fp32_dest_acc_en=fp32_dest_acc_en,
             dst_full_sync_en=dst_full_sync_en,
+            math_fidelity=math_fidelity,
             source_lines=profile_source_lines,
             all_source_lines=all_source_lines,
             kernel_line_offsets=kernel_line_offsets,
@@ -2193,6 +2254,7 @@ def _make_operation_wrapper(
     grid,
     fp32_dest_acc_en: Optional[bool],
     dst_full_sync_en: Optional[bool],
+    math_fidelity: Optional[str],
     options: Optional[str],
     prepare_call: Optional[Callable] = None,
 ) -> Callable:
@@ -2224,6 +2286,7 @@ def _make_operation_wrapper(
             resolved_grid=resolved_grid,
             fp32_dest_acc_en=fp32_dest_acc_en,
             dst_full_sync_en=dst_full_sync_en,
+            math_fidelity=math_fidelity,
             target_arch=target_arch,
             compiler_options=compiler_options,
         )
@@ -2280,7 +2343,9 @@ def _make_operation_wrapper(
     return _wrapper
 
 
-def _validate_operation_options(num_outs, memory_space, tiled) -> None:
+def _validate_operation_options(
+    num_outs, memory_space, tiled, math_fidelity: Optional[str]
+) -> None:
     if num_outs != 1:
         raise ValueError(f"num_outs must be 1, got {num_outs}")
     if memory_space not in SUPPORTED_MEMORY_SPACES:
@@ -2290,6 +2355,7 @@ def _validate_operation_options(num_outs, memory_space, tiled) -> None:
         )
     if not isinstance(tiled, bool):
         raise TypeError(f"tiled must be a boolean, got {type(tiled).__name__}")
+    validate_math_fidelity(math_fidelity)
 
 
 def pykernel_gen(
@@ -2301,6 +2367,7 @@ def pykernel_gen(
     tiled: bool = True,
     fp32_dest_acc_en: Optional[bool] = None,
     dst_full_sync_en: Optional[bool] = None,
+    math_fidelity: Optional[str] = None,
     options: Optional[str] = None,
     _prepare_call: Optional[Callable] = None,
 ) -> Callable:
@@ -2320,17 +2387,18 @@ def pykernel_gen(
         tiled: Whether to use tiled layout
         fp32_dest_acc_en: Optional override for fp32_dest_acc_en
         dst_full_sync_en: Optional override for dst_full_sync_en
+        math_fidelity: Optional TTNN compute math fidelity
         options: Compiler option string (e.g., "--no-ttl-maximize-dst")
 
     Returns:
         Decorated function that compiles and executes the kernel
 
     Raises:
-        AssertionError: If required parameters are missing or invalid
+        ValueError: If required parameters or compute configuration are invalid
     """
     if grid is None:
         raise ValueError("grid parameter is required")
-    _validate_operation_options(num_outs, memory_space, tiled)
+    _validate_operation_options(num_outs, memory_space, tiled, math_fidelity)
     if iterator_types is not None and indexing_maps is None:
         raise ValueError("indexing_maps must be set when iterator_types is set")
 
@@ -2374,6 +2442,7 @@ def pykernel_gen(
                 program_hash,
                 fp32_dest_acc_en=fp32_dest_acc_en,
                 dst_full_sync_en=dst_full_sync_en,
+                math_fidelity=math_fidelity,
                 target_arch=target_arch,
                 compiler_options=compiler_options,
             )
@@ -2384,6 +2453,7 @@ def pykernel_gen(
             grid=grid,
             fp32_dest_acc_en=fp32_dest_acc_en,
             dst_full_sync_en=dst_full_sync_en,
+            math_fidelity=math_fidelity,
             options=options,
             prepare_call=_prepare_call,
         )

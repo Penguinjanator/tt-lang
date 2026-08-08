@@ -61,6 +61,17 @@ def TTL_PipeTransferKindAttr : TTL_Attr<"PipeTransferKind",
   let assemblyFormat = "`<` $value `>`";
 }
 
+def TTL_TileExecutionStrategyAttr
+    : TTL_Attr<"TileExecutionStrategy", "tile_execution_strategy"> {
+  let summary = "Selected tile execution strategy";
+  let description = [{
+    Identifies the execution strategy that defines operand routing and DST
+    behavior for a tile operation with execution-strategy alternatives.
+  }];
+  let parameters = (ins "TileExecutionStrategy":$value);
+  let assemblyFormat = "`<` $value `>`";
+}
+
 def TTL_ExternalTemplateArgAttr
     : TTL_Attr<"ExternalTemplateArg", "external_template_arg"> {
   let summary = "Static argument to an external C++ template";

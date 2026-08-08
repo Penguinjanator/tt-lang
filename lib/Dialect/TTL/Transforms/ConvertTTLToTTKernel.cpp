@@ -2002,8 +2002,7 @@ lowerTTLOpsToTTKernel(ModuleOp mod, MLIRContext &ctx,
 /// (ttl-lower-to-loops).
 static LogicalResult
 lowerTileOpsToTTKernel(ModuleOp mod, MLIRContext &ctx,
-                       TTLToTTKernelTypeConverter &typeConverter,
-                       bool reduceFullFp32) {
+                       TTLToTTKernelTypeConverter &typeConverter) {
   ConversionTarget computeTarget(ctx);
   computeTarget.addLegalDialect<ttkernel::TTKernelDialect>();
   computeTarget.addLegalDialect<affine::AffineDialect, arith::ArithDialect>();
@@ -2036,8 +2035,7 @@ lowerTileOpsToTTKernel(ModuleOp mod, MLIRContext &ctx,
       });
 
   RewritePatternSet computePatterns(&ctx);
-  populateTTLTileOpsToTTKernelPatterns(&typeConverter, computePatterns,
-                                       reduceFullFp32);
+  populateTTLTileOpsToTTKernelPatterns(&typeConverter, computePatterns);
   return applyPartialConversion(mod, computeTarget, std::move(computePatterns));
 }
 
@@ -2237,6 +2235,10 @@ struct TTLConvertTTLToTTKernelPass
       signalPassFailure();
       return;
     }
+    if (failed(verifyTileExecutionSemantics(mod))) {
+      signalPassFailure();
+      return;
+    }
 
     // Phase 0: Expand DstSectionOp into four TTL sync ops. This inlines the
     // DstSectionOp body and inserts acquire/commit/wait/release around it,
@@ -2252,8 +2254,7 @@ struct TTLConvertTTLToTTKernelPass
     }
 
     // Phase 2: Lower tile compute ops to TTKernel (tile_add, tile_mul, ...)
-    if (failed(
-            lowerTileOpsToTTKernel(mod, ctx, typeConverter, reduceFullFp32))) {
+    if (failed(lowerTileOpsToTTKernel(mod, ctx, typeConverter))) {
       signalPassFailure();
       return;
     }
