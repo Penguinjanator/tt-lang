@@ -14,10 +14,12 @@ add_mlir_dialect_library(TTLangTTLTransforms
   DFBConcurrentKernelLivenessAnalysis.cpp
   DFBPhysicalAllocationPlan.cpp
   InterferenceGraphColoring.cpp
+  PipeNetExecutionUtils.cpp
   PipeGraph.cpp
   PipeLowering.cpp
   PipePlanning.cpp
   PipeTransferAnalysis.cpp
+  PipeTransferExpansion.cpp
   ConvertTTLToCompute.cpp
   ConvertTTLComputeToSCF.cpp
   ConvertTTLTileOpsToTTKernel.cpp

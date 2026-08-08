@@ -90,7 +90,7 @@ void createTTLToTTKernelPipeline(OpPassManager &pm,
   }
   if (options.lowerToEmitC) {
     pm.addPass(createLowerAffinePass());
-    pm.addNestedPass<func::FuncOp>(::mlir::tt::createConvertTTKernelToEmitC());
+    pm.addPass(::mlir::tt::createConvertTTKernelToEmitC());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(mlir::emitc::createFormExpressionsPass());
   }

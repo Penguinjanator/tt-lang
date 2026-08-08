@@ -12,6 +12,7 @@
 #include "ttlang/Dialect/Utils/ConversionUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "ttl-pipe-capacity-analysis"
@@ -83,27 +84,49 @@ PipeModulePlan::getTransferPlan(Operation *operation) const {
   return planIt->second;
 }
 
-static PipeType getPipeType(MLIRContext *context,
-                            const PipeResourceInfo &resources) {
-  const PipeKey &pipe = resources.pipe;
-  return PipeType::get(context, pipe.srcX, pipe.srcY, pipe.dstStartX,
-                       pipe.dstStartY, pipe.dstEndX, pipe.dstEndY,
-                       pipe.pipeNetId);
-}
-
-static FailureOr<PipeSendPlan>
-buildPipeSendPlan(PipeTransferSendOp sendOp,
-                  const DominanceInfo &dominanceInfo) {
+FailureOr<PipeTransferPayload> getPipeTransferPayload(PipeTransferSendOp sendOp,
+                                                      int64_t blockSpan) {
   FailureOr<CircularBufferType> maybeDFBType =
       utils::getTTLCircularBufferType(sendOp.getSrc());
   if (failed(maybeDFBType)) {
     sendOp.emitError("pipe transfer source must have a TTL DFB type");
     return failure();
   }
-  auto tileType =
-      llvm::dyn_cast<ttcore::TileType>((*maybeDFBType).getElementType());
+  CircularBufferType dfbType = *maybeDFBType;
+  auto tileType = llvm::dyn_cast<ttcore::TileType>(dfbType.getElementType());
   if (!tileType) {
     sendOp.emitError("pipe transfer source DFB element type must be tile");
+    return failure();
+  }
+  if (blockSpan <= 0 || dfbType.getBlockCount() % blockSpan != 0) {
+    sendOp.emitError("source DFB block count must be divisible by pipe "
+                     "transfer block span");
+    return failure();
+  }
+
+  std::optional<int64_t> maybeElementCount =
+      llvm::checkedMul(dfbType.getElementsPerBlock(), blockSpan);
+  if (!maybeElementCount) {
+    sendOp.emitError("pipe transfer element count exceeds int64_t");
+    return failure();
+  }
+  int64_t elementSizeBytes = tileType.getSizeBytes();
+  std::optional<int64_t> maybeSizeBytes =
+      llvm::checkedMul(*maybeElementCount, elementSizeBytes);
+  if (!maybeSizeBytes) {
+    sendOp.emitError("pipe transfer payload size exceeds int64_t");
+    return failure();
+  }
+  return PipeTransferPayload{*maybeElementCount, elementSizeBytes,
+                             *maybeSizeBytes};
+}
+
+static FailureOr<PipeSendPlan>
+buildPipeSendPlan(PipeTransferSendOp sendOp,
+                  const DominanceInfo &dominanceInfo) {
+  FailureOr<PipeTransferPayload> maybePayload =
+      getPipeTransferPayload(sendOp, /*blockSpan=*/1);
+  if (failed(maybePayload)) {
     return failure();
   }
 
@@ -113,12 +136,7 @@ buildPipeSendPlan(PipeTransferSendOp sendOp,
                dominanceInfo.dominates(user, sendOp);
       });
 
-  int64_t elementCount = 1;
-  for (int64_t dimension : (*maybeDFBType).getShape()) {
-    elementCount *= dimension;
-  }
-  return PipeSendPlan{readFromDFB, elementCount * static_cast<int64_t>(
-                                                      tileType.getSizeBytes())};
+  return PipeSendPlan{readFromDFB, maybePayload->sizeBytes};
 }
 
 static FailureOr<PipePostPlan>
@@ -378,31 +396,31 @@ buildPipeModulePlan(ModuleOp module, ValueOriginAnalysis &analysis,
   });
 
   DominanceInfo dominanceInfo(module);
-  for (const auto &resourceEntry : plan.resourcePlan.resources) {
-    Operation *operation = resourceEntry.first;
-    const PipeResourceInfo &resources = resourceEntry.second;
+  auto addTransferPlan =
+      [&](Operation *operation, PipeReference pipeReference,
+          PipeTransferPlan::Resources resources) -> LogicalResult {
     auto sendOp = dyn_cast<PipeTransferSendOp>(operation);
     auto postOp = dyn_cast<PipeTransferPostOp>(operation);
-    if (!sendOp && !postOp) {
-      assert(isa<PipeTransferWaitOp>(operation) &&
-             "pipe resources assigned to an unsupported operation");
-      continue;
-    }
+    auto waitOp = dyn_cast<PipeTransferWaitOp>(operation);
+    assert((sendOp || postOp || waitOp) &&
+           "pipe resources assigned to an unsupported operation");
     bool usesCapacityProtocol =
+        (sendOp || postOp) &&
         synchronizationSelection.usesCapacityProtocol(operation);
     PipeSynchronizationProtocol synchronizationProtocol =
         usesCapacityProtocol ? PipeSynchronizationProtocol::Capacity
                              : PipeSynchronizationProtocol::ReceiverPost;
 
-    auto addTransferPlan = [&](auto operationPlan) {
-      PipeTransferPlan transferPlan(getPipeType(module.getContext(), resources),
-                                    resources, synchronizationProtocol,
-                                    std::move(operationPlan));
-      auto [planIt, inserted] =
-          plan.transferPlans.insert({operation, std::move(transferPlan)});
-      (void)planIt;
-      assert(inserted && "pipe operation has more than one transfer plan");
-    };
+    auto insertTransferPlan =
+        [&](PipeTransferPlan::OperationPlan operationPlan) {
+          PipeTransferPlan transferPlan(
+              std::move(pipeReference), std::move(resources),
+              synchronizationProtocol, std::move(operationPlan));
+          auto [planIt, inserted] =
+              plan.transferPlans.insert({operation, std::move(transferPlan)});
+          (void)planIt;
+          assert(inserted && "pipe operation has more than one transfer plan");
+        };
 
     if (sendOp) {
       FailureOr<PipeSendPlan> maybeSendPlan =
@@ -410,14 +428,49 @@ buildPipeModulePlan(ModuleOp module, ValueOriginAnalysis &analysis,
       if (failed(maybeSendPlan)) {
         return failure();
       }
-      addTransferPlan(*maybeSendPlan);
-    } else {
+      insertTransferPlan(*maybeSendPlan);
+    } else if (postOp) {
+      const PipeResourceInfo &postResources =
+          std::holds_alternative<PipeResourceInfo>(resources)
+              ? std::get<PipeResourceInfo>(resources)
+              : std::get<SmallVector<PipeResourceInfo>>(resources).front();
       FailureOr<PipePostPlan> maybePostPlan =
-          buildPipePostPlan(postOp, resources);
+          buildPipePostPlan(postOp, postResources);
       if (failed(maybePostPlan)) {
         return failure();
       }
-      addTransferPlan(*maybePostPlan);
+      insertTransferPlan(*maybePostPlan);
+    } else {
+      insertTransferPlan(PipeWaitPlan{});
+    }
+    return success();
+  };
+
+  for (const auto &[operation, resources] : plan.resourcePlan.resources) {
+    FailureOr<PipeReference> maybePipeReference =
+        getPipeReferenceForProtocolOp(operation, transferIndex);
+    if (failed(maybePipeReference)) {
+      return failure();
+    }
+    assert(maybePipeReference->isStatic() &&
+           "static resources require a static pipe reference");
+    if (failed(addTransferPlan(operation, std::move(*maybePipeReference),
+                               resources))) {
+      return failure();
+    }
+  }
+  for (const auto &[operation, resources] :
+       plan.resourcePlan.selectedResources) {
+    FailureOr<PipeReference> maybePipeReference =
+        getPipeReferenceForProtocolOp(operation, transferIndex);
+    if (failed(maybePipeReference)) {
+      return failure();
+    }
+    assert(maybePipeReference->isSelected() &&
+           "selected resources require a selected pipe reference");
+    if (failed(addTransferPlan(operation, std::move(*maybePipeReference),
+                               SmallVector<PipeResourceInfo>(resources)))) {
+      return failure();
     }
   }
 
