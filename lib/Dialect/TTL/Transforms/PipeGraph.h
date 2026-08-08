@@ -226,6 +226,8 @@ struct PipeTransferNode {
   PipeTransferNodeId id = 0;
   PipeKey pipe;
   PipeTransferContract transferContract = PipeTransferContract::PointToPoint;
+  int64_t blockSpan = 1;
+  int64_t destinationGroupDepth = 1;
   Operation *sendOp = nullptr;
   SmallVector<Operation *> receiverPostOps;
   SmallVector<PipeReceiverEndpointId> receiverEndpoints;
@@ -379,6 +381,16 @@ getPipeReferenceForProtocolOp(Operation *protocolOp,
 /// Enumerate the static pipe types represented by a pipe reference.
 SmallVector<PipeType> getPipeTypesFromReference(MLIRContext *context,
                                                 const PipeReference &ref);
+
+/// Return the number of original DFB blocks delivered by one transfer.
+inline int64_t getPipeTransferBlockSpan(PipeTransferCreateOp op) {
+  return static_cast<int64_t>(op.getBlockSpan());
+}
+
+/// Return the maximum number of resident transfers planned per receiver DFB.
+inline int64_t getPipeTransferDestinationGroupDepth(PipeTransferCreateOp op) {
+  return static_cast<int64_t>(op.getDestinationGroupDepth());
+}
 
 /// Graph of transfer definitions, receiver endpoints, physical receiver DFBs,
 /// and proven receiver address sequences.

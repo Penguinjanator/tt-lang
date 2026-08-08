@@ -10,6 +10,7 @@
 #include "ttlang/Dialect/TTL/IR/TTLOps.h"
 #include "ttlang/Dialect/TTL/IR/TTLOpsUtils.h"
 #include "ttlang/Dialect/TTL/Transforms/TransferProvenance.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -17,6 +18,11 @@
 
 namespace mlir::tt::ttl {
 namespace {
+
+enum class PipeTransferExpansionMode {
+  All,
+  StaticPipesOnly,
+};
 
 /// Convert a semantic transfer contract to its explicit IR enum.
 static PipeTransferKind getPipeTransferKind(PipeTransferContract contract) {
@@ -120,15 +126,75 @@ struct PipeTransferExpansionPlan {
   SmallVector<WaitOp> unreachableReceiveWaits;
 };
 
+/// Return whether the selected expansion mode includes `pipe`.
+static bool
+shouldExpandPipeValue(Value pipe, PipeTransferExpansionMode mode,
+                      const llvm::DenseSet<PipeKey> &selectedPipeKeys) {
+  if (mode == PipeTransferExpansionMode::All) {
+    return true;
+  }
+  auto pipeType =
+      mlir::dyn_cast<PipeType>(traceUnrealizedCasts(pipe).getType());
+  return pipeType && !selectedPipeKeys.contains(getPipeKey(pipeType));
+}
+
+/// Return the static pipe relations that also occur in selected callbacks.
+///
+/// Partially expanding either endpoint would expose an incomplete transfer to
+/// PipeGraph while its corresponding selected endpoint remains high-level IR.
+static FailureOr<llvm::DenseSet<PipeKey>>
+collectSelectedPipeKeys(ModuleOp module) {
+  llvm::DenseSet<PipeKey> selectedPipeKeys;
+  LogicalResult result = success();
+  module.walk([&](CopyOp copyOp) {
+    Value pipe;
+    if (isPipeReceiveCopy(copyOp)) {
+      pipe = copyOp.getSrc();
+    } else if (isPipeSendCopy(copyOp)) {
+      pipe = copyOp.getDst();
+    } else {
+      return;
+    }
+    if (!mlir::isa<SelectedPipeSrcType, SelectedPipeDstType>(
+            traceUnrealizedCasts(pipe).getType())) {
+      return;
+    }
+    FailureOr<SelectedPipeRecords> maybeRecords = getSelectedPipeRecords(pipe);
+    if (failed(maybeRecords)) {
+      copyOp.emitError("cannot resolve selected PipeNet records");
+      result = failure();
+      return;
+    }
+    for (PipeRecordAttr record : maybeRecords->records.getPipes()) {
+      selectedPipeKeys.insert(
+          getPipeKey(record, maybeRecords->records.getPipeNetId()));
+    }
+  });
+  if (failed(result)) {
+    return failure();
+  }
+  return selectedPipeKeys;
+}
+
 /// Collect every replacement before expansion invalidates origin analysis.
 static FailureOr<PipeTransferExpansionPlan>
-buildPipeTransferExpansionPlan(ModuleOp module, ValueOriginAnalysis &analysis) {
+buildPipeTransferExpansionPlan(ModuleOp module, ValueOriginAnalysis &analysis,
+                               PipeTransferExpansionMode mode) {
   PipeTransferExpansionPlan plan;
+  FailureOr<llvm::DenseSet<PipeKey>> maybeSelectedPipeKeys =
+      collectSelectedPipeKeys(module);
+  if (failed(maybeSelectedPipeKeys)) {
+    return failure();
+  }
+  const llvm::DenseSet<PipeKey> &selectedPipeKeys = *maybeSelectedPipeKeys;
   module.walk([&](CreatePipeOp op) { plan.createPipes.push_back(op); });
 
   LogicalResult result = success();
   module.walk([&](CopyOp op) {
     if (isPipeReceiveCopy(op)) {
+      if (!shouldExpandPipeValue(op.getSrc(), mode, selectedPipeKeys)) {
+        return;
+      }
       FailureOr<PipeTransferContract> contract =
           getPipeTransferContractForPipeValue(analysis, op.getSrc());
       if (failed(contract)) {
@@ -148,6 +214,9 @@ buildPipeTransferExpansionPlan(ModuleOp module, ValueOriginAnalysis &analysis) {
       return;
     }
     if (isPipeSendCopy(op)) {
+      if (!shouldExpandPipeValue(op.getDst(), mode, selectedPipeKeys)) {
+        return;
+      }
       FailureOr<PipeTransferContract> contract =
           getPipeTransferContractForPipeValue(analysis, op.getDst());
       if (failed(contract)) {
@@ -171,7 +240,9 @@ buildPipeTransferExpansionPlan(ModuleOp module, ValueOriginAnalysis &analysis) {
       return;
     }
     if (analysis.getOrigins(waitOp.getXf()).empty()) {
-      plan.unreachableReceiveWaits.push_back(waitOp);
+      if (mode == PipeTransferExpansionMode::All) {
+        plan.unreachableReceiveWaits.push_back(waitOp);
+      }
       return;
     }
     FailureOr<std::optional<CopyOp>> maybeCopyOp =
@@ -184,6 +255,9 @@ buildPipeTransferExpansionPlan(ModuleOp module, ValueOriginAnalysis &analysis) {
       return;
     }
     CopyOp copyOp = **maybeCopyOp;
+    if (!shouldExpandPipeValue(copyOp.getSrc(), mode, selectedPipeKeys)) {
+      return;
+    }
     FailureOr<int64_t> pipeNetId =
         getPipeNetIdForPipeValue(waitOp, copyOp.getSrc());
     if (failed(pipeNetId)) {
@@ -267,7 +341,20 @@ applyPipeTransferExpansionPlan(ModuleOp module,
 LogicalResult expandPipeTransfers(ModuleOp module,
                                   ValueOriginAnalysis &analysis) {
   FailureOr<PipeTransferExpansionPlan> maybePlan =
-      buildPipeTransferExpansionPlan(module, analysis);
+      buildPipeTransferExpansionPlan(module, analysis,
+                                     PipeTransferExpansionMode::All);
+  if (failed(maybePlan)) {
+    return failure();
+  }
+  applyPipeTransferExpansionPlan(module, *maybePlan);
+  return success();
+}
+
+LogicalResult expandStaticPipeTransfers(ModuleOp module,
+                                        ValueOriginAnalysis &analysis) {
+  FailureOr<PipeTransferExpansionPlan> maybePlan =
+      buildPipeTransferExpansionPlan(
+          module, analysis, PipeTransferExpansionMode::StaticPipesOnly);
   if (failed(maybePlan)) {
     return failure();
   }

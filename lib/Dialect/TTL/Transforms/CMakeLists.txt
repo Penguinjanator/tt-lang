@@ -20,6 +20,8 @@ add_mlir_dialect_library(TTLangTTLTransforms
   PipePlanning.cpp
   PipeTransferAnalysis.cpp
   PipeTransferExpansion.cpp
+  PipeTransportDFBAnalysis.cpp
+  PipeTransportPlan.cpp
   ConvertTTLToCompute.cpp
   ConvertTTLComputeToSCF.cpp
   ConvertTTLTileOpsToTTKernel.cpp
@@ -33,6 +35,7 @@ add_mlir_dialect_library(TTLangTTLTransforms
   TTLCoalesceDFBAcquires.cpp
   TTLDumpCBFlowGraph.cpp
   TTLFinalizeDFBIndices.cpp
+  TTLFormPipeTransports.cpp
   TTLValidateCBBudget.cpp
   TTLInsertCBSync.cpp
   TTLInsertCopyWait.cpp
@@ -67,6 +70,7 @@ add_mlir_dialect_library(TTLangTTLTransforms
   MLIRPass
   MLIRTensorDialect
   MLIRTilingInterface
+  MLIRTransforms
   MLIRTTKernelDialect
   MLIRTTLDialect
   TTLangAnalysis

@@ -9,6 +9,7 @@
 #include "ttlang/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttlang/Dialect/TTL/IR/TTL.h"
 #include "ttlang/Dialect/TTL/IR/TTLOpsUtils.h"
+#include "ttlang/Dialect/TTL/Transforms/PipeTransferAnalysis.h"
 #include "ttlang/Dialect/Utils/ConversionUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -41,6 +42,20 @@ PipeCapacityPlan::lookupReleases(CBPopOp op) const {
     return {};
   }
   return releaseIt->second;
+}
+
+SmallVector<CBPopOp, 1>
+PipeCapacityPlan::findReleaseOps(PipeTransferNodeId transferNode) const {
+  SmallVector<CBPopOp, 1> releaseOps;
+  for (const auto &[operation, releaseInfos] : releases) {
+    if (llvm::any_of(releaseInfos,
+                     [&](const PipeCapacityReleaseInfo &releaseInfo) {
+                       return releaseInfo.transferNode == transferNode;
+                     })) {
+      releaseOps.push_back(cast<CBPopOp>(operation));
+    }
+  }
+  return releaseOps;
 }
 
 void PipeCapacityPlan::addAcquire(PipeTransferSendOp op,
@@ -122,10 +137,10 @@ FailureOr<PipeTransferPayload> getPipeTransferPayload(PipeTransferSendOp sendOp,
 }
 
 static FailureOr<PipeSendPlan>
-buildPipeSendPlan(PipeTransferSendOp sendOp,
-                  const DominanceInfo &dominanceInfo) {
+buildPipeSendPlan(PipeTransferSendOp sendOp, const DominanceInfo &dominanceInfo,
+                  int64_t blockSpan) {
   FailureOr<PipeTransferPayload> maybePayload =
-      getPipeTransferPayload(sendOp, /*blockSpan=*/1);
+      getPipeTransferPayload(sendOp, blockSpan);
   if (failed(maybePayload)) {
     return failure();
   }
@@ -142,7 +157,7 @@ buildPipeSendPlan(PipeTransferSendOp sendOp,
 static FailureOr<PipePostPlan>
 buildPipePostPlan(PipeTransferPostOp postOp,
                   const PipeResourceInfo &resources) {
-  if (resources.addressStorage.usesComputedReceiverDFB()) {
+  if (resources.addressStorage.usesComputedReceiverAddress()) {
     return PipePostPlan{};
   }
 
@@ -203,6 +218,9 @@ isCapacityProtocolLowerable(const PipeCapacityEndpointFacts &endpointFacts,
     return false;
   }
   const PipeResourceInfo &resource = resourceIt->second;
+  if (endpointFacts.transportOwnsStorage) {
+    return true;
+  }
   if (!resource.addressStorage.usesComputedReceiverDFB()) {
     debugSkipResource(resource, "receiver address is not computed");
     return false;
@@ -274,12 +292,13 @@ public:
       auto resourceIt = resources.resources.find(transferNode.sendOp);
       assert(resourceIt != resources.resources.end() &&
              "selected capacity transfer is missing final resources");
-      assert(resourceIt->second.addressStorage.usesComputedReceiverDFB() &&
-             "selected capacity transfer lost computed receiver addresses");
       for (PipeReceiverEndpointId endpoint :
            pipeGraph.getPipeReceiverEndpoints(transferNode.id)) {
         const PipeCapacityEndpointFacts &endpointFacts =
             capacityFacts.getEndpointFacts(endpoint);
+        assert((endpointFacts.transportOwnsStorage ||
+                resourceIt->second.addressStorage.usesComputedReceiverDFB()) &&
+               "selected capacity transfer has no direct receiver address");
         PipeCounterInfo capacityCounter =
             allocateCapacityCounter(endpointFacts, counterColors, plan);
         recordEndpointCapacityFacts(endpointFacts, capacityCounter, plan);
@@ -292,15 +311,18 @@ private:
   recordEndpointCapacityFacts(const PipeCapacityEndpointFacts &endpointFacts,
                               PipeCounterInfo capacityCounter,
                               PipeCapacityPlan &plan) {
-    plan.addAcquire(endpointFacts.send,
-                    PipeCapacityAcquireInfo{capacityCounter, 1});
+    plan.addAcquire(
+        endpointFacts.send,
+        PipeCapacityAcquireInfo{capacityCounter,
+                                endpointFacts.receiverBlocksPerTransfer});
     plan.addInitialization(
         endpointFacts.send->getParentOfType<func::FuncOp>(),
         PipeCapacityInitInfo{capacityCounter, endpointFacts.initialCapacity});
     for (CBPopOp popOp : endpointFacts.pops) {
-      plan.addRelease(popOp,
-                      PipeCapacityReleaseInfo{endpointFacts.releaseTarget,
-                                              capacityCounter, 1});
+      plan.addRelease(popOp, PipeCapacityReleaseInfo{
+                                 endpointFacts.transferNode,
+                                 endpointFacts.releaseTarget, capacityCounter,
+                                 endpointFacts.receiverBlocksPerTransfer});
     }
   }
 
@@ -382,6 +404,21 @@ buildPipeModulePlan(ModuleOp module, ValueOriginAnalysis &analysis,
     return failure();
   }
 
+  auto selectSynchronizationProtocol = [&](PipeTransferNodeId transferNodeId) {
+    const PipeTransferNode &transferNode =
+        pipeGraph.getPipeTransferNode(transferNodeId);
+    auto sendOp = cast<PipeTransferSendOp>(transferNode.sendOp);
+    return synchronizationSelection.usesCapacityProtocol(sendOp)
+               ? PipeSynchronizationProtocol::Capacity
+               : PipeSynchronizationProtocol::ReceiverPost;
+  };
+  FailureOr<PipeTransportPlan> maybeTransportPlan = buildPipeTransportPlan(
+      pipeGraph, plan.capacityPlan, selectSynchronizationProtocol);
+  if (failed(maybeTransportPlan)) {
+    return failure();
+  }
+  plan.transportPlan = std::move(*maybeTransportPlan);
+  finalizePipeTransportResources(plan.transportPlan, plan.resourcePlan);
   const PipeCapacityPlan *maybeCapacityPlan =
       options.enableCapacitySynchronization ? &plan.capacityPlan : nullptr;
   plan.resourceRequirements =
@@ -423,8 +460,10 @@ buildPipeModulePlan(ModuleOp module, ValueOriginAnalysis &analysis,
         };
 
     if (sendOp) {
-      FailureOr<PipeSendPlan> maybeSendPlan =
-          buildPipeSendPlan(sendOp, dominanceInfo);
+      PipeTransferCreateOp transferCreate =
+          transferIndex.getTransferCreate(operation);
+      FailureOr<PipeSendPlan> maybeSendPlan = buildPipeSendPlan(
+          sendOp, dominanceInfo, getPipeTransferBlockSpan(transferCreate));
       if (failed(maybeSendPlan)) {
         return failure();
       }
@@ -480,6 +519,9 @@ buildPipeModulePlan(ModuleOp module, ValueOriginAnalysis &analysis,
 void applyPipeModuleAttributes(ModuleOp module, const PipeModulePlan &plan) {
   Builder builder(module.getContext());
   const PipeResourcePlan &resources = plan.getResourcePlan();
+  module.walk([&](func::FuncOp function) {
+    function->removeAttr(kPipeComputedAddressDFBIndicesAttrName);
+  });
   for (const auto &[function, dfbIndices] :
        resources.computedAddressDFBIndices) {
     function->setAttr(kPipeComputedAddressDFBIndicesAttrName,
