@@ -21,15 +21,40 @@ INSTALL_EXABOX_WORKER = (
 UPLIFT_PATHS = REPO_ROOT / ".github" / "scripts" / "uplift-paths.sh"
 
 
-def test_galaxy_tests_run_only_for_pull_requests_targeting_main() -> None:
+def test_pull_request_ci_targets_main_only() -> None:
     ci_workflow = CI_WORKFLOW.read_text()
-    call_build = CALL_BUILD.read_text()
-    n150_workflow = CALL_TEST_HARDWARE.read_text()
 
     assert (
-        "run_galaxy_tests: ${{ github.event_name == 'pull_request' "
-        "&& github.base_ref == 'main' }}" in ci_workflow
+        '  pull_request:\n    branches: ["main"]\n'
+        "    types: [opened, synchronize, reopened, ready_for_review, edited]"
+        in ci_workflow
     )
+
+
+def test_hardware_event_policy_and_manual_controls() -> None:
+    ci_workflow = CI_WORKFLOW.read_text()
+    call_build = CALL_BUILD.read_text()
+
+    assert ci_workflow.count("run_galaxy_tests:") == 2
+    assert ci_workflow.count("run_loudbox_tests:") == 2
+    assert (
+        "run_galaxy_tests: ${{ (github.event_name == 'push' "
+        "&& github.ref == 'refs/heads/main') || "
+        "github.event_name == 'schedule' || "
+        "(github.event_name == 'workflow_dispatch' && inputs.run_galaxy_tests) }}"
+        in ci_workflow
+    )
+    assert (
+        "run_loudbox_tests: ${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.run_loudbox_tests }}" in ci_workflow
+    )
+    assert call_build.count("run_galaxy_tests:") == 2
+    assert call_build.count("run_loudbox_tests:") == 2
+
+
+def test_exabox_configuration_remains_available() -> None:
+    call_build = CALL_BUILD.read_text()
+
     assert "uses: ./.github/workflows/call-test-exabox.yml" in call_build
     assert "if: ${{ inputs.run_galaxy_tests }}" in call_build
     assert "needs: [test-hardware, test-exabox]" in call_build
@@ -37,8 +62,27 @@ def test_galaxy_tests_run_only_for_pull_requests_targeting_main() -> None:
         "\n    report-skipped-galaxy:", 1
     )[0]
     assert "timeout: 90" in test_exabox
-    assert '"in-service", "galaxy-bh"' not in call_build
-    assert "galaxy-bh" not in n150_workflow
+
+
+def test_hardware_matrix_adds_manual_blackhole_loudbox() -> None:
+    call_build = CALL_BUILD.read_text()
+    hardware_workflow = CALL_TEST_HARDWARE.read_text()
+
+    assert "inputs.run_loudbox_tests && fromJSON" in call_build
+    assert '["n150","bh-loudbox-viommu"]' in call_build
+    assert "matrix.hardware == 'bh-loudbox-viommu'" in call_build
+    assert "tt-ubuntu-2204-bh-loudbox-viommu-stable" in call_build
+    assert "tt-ubuntu-2204-n150-stable" in call_build
+    assert (
+        "defer_result_check: ${{ matrix.hardware != 'bh-loudbox-viommu' }}"
+        in call_build
+    )
+    assert "--optional-runner" not in call_build
+    assert "inputs.run_galaxy_tests && 3 || 2" in call_build
+    assert "inputs.run_galaxy_tests && 2 || 1" in call_build
+    assert 'name: "Hardware Tests (${{ inputs.hardware }})"' in hardware_workflow
+    assert "runs-on: ${{ inputs.runner_label }}" in hardware_workflow
+    assert "RUNS_ON: ${{ inputs.hardware }}" in hardware_workflow
 
 
 def test_exabox_workflow_dispatches_all_worker_operations_through_scripts() -> None:
