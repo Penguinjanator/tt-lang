@@ -14,6 +14,7 @@ setup() {
     EXABOX_REPORT_DIR="$BATS_TEST_TMPDIR/shared/reports"
     MPIRUN_CALLS="$BATS_TEST_TMPDIR/mpirun.calls"
     export GITHUB_WORKSPACE STAGE_DIR WORKER_SRC EXABOX_REPORT_DIR MPIRUN_CALLS
+    unset CCACHE_DIR
 
     mkdir -p "$GITHUB_WORKSPACE/.github/scripts" "$BATS_TEST_TMPDIR/bin"
     cp "$SCRIPT" "$GITHUB_WORKSPACE/.github/scripts/"
@@ -23,12 +24,30 @@ setup() {
     cat > "$BATS_TEST_TMPDIR/bin/mpirun" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$MPIRUN_CALLS"
-shift 2
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --pernode | --tag-output) shift ;;
+        --bind-to) shift 2 ;;
+        *) break ;;
+    esac
+done
 exec "$@"
 EOF
     chmod +x "$BATS_TEST_TMPDIR/bin/mpirun"
     PATH="$BATS_TEST_TMPDIR/bin:$PATH"
     export PATH
+}
+
+@test "stage makes the restored ccache writable by worker UID 1001" {
+    mkdir -p "$BATS_TEST_TMPDIR/shared/ccache"
+    echo cached > "$BATS_TEST_TMPDIR/shared/ccache/object"
+    chmod 0700 "$BATS_TEST_TMPDIR/shared/ccache"
+    chmod 0600 "$BATS_TEST_TMPDIR/shared/ccache/object"
+
+    CCACHE_DIR="$BATS_TEST_TMPDIR/shared/ccache" run -0 "$SCRIPT" stage
+
+    [ "$(stat -c '%a' "$BATS_TEST_TMPDIR/shared/ccache")" = 777 ]
+    [ "$(stat -c '%a' "$BATS_TEST_TMPDIR/shared/ccache/object")" = 666 ]
 }
 
 @test "stage copies the checkout through shared storage to the worker" {
@@ -43,7 +62,7 @@ EOF
     [ ! -e "$WORKER_SRC/stale.txt" ]
     [ "$(stat -c '%a' "$EXABOX_REPORT_DIR")" = 777 ]
     run cat "$MPIRUN_CALLS"
-    assert_output "--pernode --tag-output bash $STAGE_DIR/.github/scripts/prepare-exabox-workspace.sh install"
+    assert_output "--pernode --bind-to none --tag-output bash $STAGE_DIR/.github/scripts/prepare-exabox-workspace.sh install"
 }
 
 @test "install does not require the CPU runner workspace" {
@@ -65,6 +84,9 @@ EOF
 
     EXABOX_REPORT_DIR=/ run -2 "$SCRIPT" stage
     assert_output --partial "EXABOX_REPORT_DIR must not be /"
+
+    CCACHE_DIR=/ run -2 "$SCRIPT" stage
+    assert_output --partial "CCACHE_DIR must not be /"
 }
 
 @test "stage and worker directories must differ" {

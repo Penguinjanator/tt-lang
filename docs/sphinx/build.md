@@ -528,11 +528,21 @@ tests through `call-test-exabox.yml`. The Exabox job uses
 `exabox-multihost-ci-sc1`, which provisions a Galaxy allocation from the IRD
 image while Actions steps execute in a CPU-side container. The checkout is
 staged on `/ci`, copied to `/home/user/tt-lang` on every worker host, and reset,
-build, and test commands execute through `mpirun --pernode`.
+build, and test commands execute through `mpirun --pernode --bind-to none` so
+OpenMPI does not restrict each worker shell and its child processes to one core.
 
 `manual-test-exabox.yml` builds and publishes the current revision's IRD image,
 then dispatches the same reusable workflow with the resulting tag. This keeps
 the worker toolchain and Exabox services aligned with the tested source.
+
+Exabox workers and `/ci` storage have job lifetime. The CPU-side Actions
+container restores ccache state under shared `/ci` storage, and the staging
+script makes the job-scoped cache writable by controller and worker UIDs. The
+reusable workflow defaults to a 90-minute timeout.
+
+The Galaxy job runs Python lit, simulator, and device pytest execution with 32
+parallel workers, matching the Galaxy chip count without exceeding the 64-thread
+host allocation. Device pytests retain the shared 300-second timeout.
 
 #### Rebuilding Docker images
 
