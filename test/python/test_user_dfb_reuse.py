@@ -33,6 +33,9 @@ SCALAR_RESULT_HEADER = os.path.join(
 REPEATED_TRANSACTION_HEADER = os.path.join(
     os.path.dirname(__file__), "include", "repeated_dfb_transactions.hpp"
 )
+DFB_RESET_TEST_HEADER = os.path.join(
+    os.path.dirname(__file__), "include", "dfb_reset_test_helpers.hpp"
+)
 
 
 def _make_exp_via_scratch_atom(data_format, shape=(1, 1)):
@@ -471,6 +474,332 @@ def _make_dispatch_condition_lifecycle_kernel(data_format, predicate_value):
     return dispatch_condition_lifecycle_kernel
 
 
+def _make_synchronized_reset_kernel(
+    data_format,
+    reset_all,
+    grid_cols=1,
+    tile=(32, 32),
+    use_compute_passthrough=True,
+):
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    reset = ttl.DFBReset(
+        participants=(compute_kernel, reader_kernel, writer_kernel),
+    )
+
+    if reset_all:
+
+        @ttl.operation(grid=(grid_cols, 1))
+        def synchronized_reset_kernel(input_tensor, output_tensor):
+            stale_dfb = ttl.make_dfb(
+                data_format, shape=(1, 1), block_count=1, tile=tile
+            )
+            current_dfb = ttl.make_dfb(
+                data_format, shape=(1, 1), block_count=1, tile=tile
+            )
+            if use_compute_passthrough:
+                output_dfb = ttl.make_dfb(
+                    data_format, shape=(1, 1), block_count=1, tile=tile
+                )
+
+                @ttl.compute(kernel=compute_kernel)
+                def compute():
+                    ttl.reset_all_dfbs(reset)
+                    with current_dfb.wait() as current_source:
+                        with output_dfb.reserve() as output_destination:
+                            output_destination.store(current_source)
+
+                source_dfb = output_dfb
+
+            else:
+
+                @ttl.compute(kernel=compute_kernel)
+                def compute():
+                    ttl.reset_all_dfbs(reset)
+
+                source_dfb = current_dfb
+
+            @ttl.datamovement(kernel=reader_kernel)
+            def read():
+                node_x, _ = ttl.node(dims=2)
+                with stale_dfb.reserve() as stale_destination:
+                    ttl.copy(input_tensor[0, node_x], stale_destination).wait()
+                ttl.reset_all_dfbs(reset)
+                with current_dfb.reserve() as current_destination:
+                    ttl.copy(
+                        input_tensor[0, grid_cols + node_x], current_destination
+                    ).wait()
+
+            @ttl.datamovement(kernel=writer_kernel)
+            def write():
+                node_x, _ = ttl.node(dims=2)
+                ttl.reset_all_dfbs(reset)
+                with source_dfb.wait() as output_source:
+                    ttl.copy(output_source, output_tensor[0, node_x]).wait()
+
+    else:
+
+        @ttl.operation(grid=(grid_cols, 1))
+        def synchronized_reset_kernel(input_tensor, output_tensor):
+            stale_dfb = ttl.make_dfb(
+                data_format, shape=(1, 1), block_count=1, tile=tile
+            )
+            current_dfb = ttl.make_dfb(
+                data_format, shape=(1, 1), block_count=1, tile=tile
+            )
+            if use_compute_passthrough:
+                output_dfb = ttl.make_dfb(
+                    data_format, shape=(1, 1), block_count=1, tile=tile
+                )
+
+                @ttl.compute(kernel=compute_kernel)
+                def compute():
+                    ttl.reset_dfbs(reset, dfbs=[stale_dfb])
+                    with current_dfb.wait() as current_source:
+                        with output_dfb.reserve() as output_destination:
+                            output_destination.store(current_source)
+
+                source_dfb = output_dfb
+
+            else:
+
+                @ttl.compute(kernel=compute_kernel)
+                def compute():
+                    ttl.reset_dfbs(reset, dfbs=[stale_dfb])
+
+                source_dfb = current_dfb
+
+            @ttl.datamovement(kernel=reader_kernel)
+            def read():
+                node_x, _ = ttl.node(dims=2)
+                with stale_dfb.reserve() as stale_destination:
+                    ttl.copy(input_tensor[0, node_x], stale_destination).wait()
+                ttl.reset_dfbs(reset, dfbs=[stale_dfb])
+                with current_dfb.reserve() as current_destination:
+                    ttl.copy(
+                        input_tensor[0, grid_cols + node_x], current_destination
+                    ).wait()
+
+            @ttl.datamovement(kernel=writer_kernel)
+            def write():
+                node_x, _ = ttl.node(dims=2)
+                ttl.reset_dfbs(reset, dfbs=[stale_dfb])
+                with source_dfb.wait() as output_source:
+                    ttl.copy(output_source, output_tensor[0, node_x]).wait()
+
+    return synchronized_reset_kernel
+
+
+def _make_compute_interface_reset_kernel(data_format, tile):
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    reset = ttl.DFBReset(
+        participants=(compute_kernel, reader_kernel, writer_kernel),
+    )
+
+    @ttl.operation(grid=(1, 1))
+    def compute_interface_reset_kernel(input_tensor, output_tensor):
+        initial_source = ttl.make_dfb(
+            data_format, shape=(1, 1), block_count=1, tile=tile
+        )
+        before_reset = ttl.make_dfb(data_format, shape=(1, 1), block_count=1, tile=tile)
+        current_source = ttl.make_dfb(
+            data_format, shape=(1, 1), block_count=1, tile=tile
+        )
+        current_output = ttl.make_dfb(
+            data_format, shape=(1, 1), block_count=1, tile=tile
+        )
+
+        @ttl.compute(kernel=compute_kernel)
+        def compute():
+            with initial_source.wait() as initial_block:
+                with before_reset.reserve() as before_reset_block:
+                    before_reset_block.store(initial_block)
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_source.wait() as current_source_block:
+                with before_reset.reserve() as after_reset_block:
+                    after_reset_block.store(current_source_block)
+            with before_reset.wait() as after_reset_block:
+                with current_output.reserve() as current_output_block:
+                    current_output_block.store(after_reset_block)
+
+        @ttl.datamovement(kernel=reader_kernel)
+        def read():
+            with initial_source.reserve() as initial_block:
+                ttl.copy(input_tensor[0, 0], initial_block).wait()
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_source.reserve() as current_source_block:
+                ttl.copy(input_tensor[0, 1], current_source_block).wait()
+
+        @ttl.datamovement(kernel=writer_kernel)
+        def write():
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_output.wait() as output_block:
+                ttl.copy(output_block, output_tensor[0, 0]).wait()
+
+    return compute_interface_reset_kernel
+
+
+def _make_high_index_synchronized_reset_kernel(data_format):
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    reset = ttl.DFBReset(
+        participants=(compute_kernel, reader_kernel, writer_kernel),
+    )
+
+    @ttl.operation(grid=(1, 1))
+    def synchronized_reset_kernel(input_tensor, output_tensor):
+        padding_dfb_00 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_01 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_02 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_03 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_04 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_05 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_06 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_07 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_08 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_09 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_10 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_11 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_12 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_13 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_14 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_15 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_16 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_17 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_18 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_19 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_20 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_21 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_22 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_23 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_24 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_25 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_26 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_27 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_28 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_29 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_30 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        padding_dfb_31 = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        initial_source = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        before_reset = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        current_source = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        current_output = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+
+        @ttl.compute(kernel=compute_kernel)
+        def compute():
+            ttl.call_extern_func(
+                DFB_RESET_TEST_HEADER,
+                "retain_dfb_liveness",
+                template_args=[
+                    ttl.dfb_descriptor(padding_dfb_00),
+                    ttl.dfb_descriptor(padding_dfb_01),
+                    ttl.dfb_descriptor(padding_dfb_02),
+                    ttl.dfb_descriptor(padding_dfb_03),
+                    ttl.dfb_descriptor(padding_dfb_04),
+                    ttl.dfb_descriptor(padding_dfb_05),
+                    ttl.dfb_descriptor(padding_dfb_06),
+                    ttl.dfb_descriptor(padding_dfb_07),
+                    ttl.dfb_descriptor(padding_dfb_08),
+                    ttl.dfb_descriptor(padding_dfb_09),
+                    ttl.dfb_descriptor(padding_dfb_10),
+                    ttl.dfb_descriptor(padding_dfb_11),
+                    ttl.dfb_descriptor(padding_dfb_12),
+                    ttl.dfb_descriptor(padding_dfb_13),
+                    ttl.dfb_descriptor(padding_dfb_14),
+                    ttl.dfb_descriptor(padding_dfb_15),
+                    ttl.dfb_descriptor(padding_dfb_16),
+                    ttl.dfb_descriptor(padding_dfb_17),
+                    ttl.dfb_descriptor(padding_dfb_18),
+                    ttl.dfb_descriptor(padding_dfb_19),
+                    ttl.dfb_descriptor(padding_dfb_20),
+                    ttl.dfb_descriptor(padding_dfb_21),
+                    ttl.dfb_descriptor(padding_dfb_22),
+                    ttl.dfb_descriptor(padding_dfb_23),
+                    ttl.dfb_descriptor(padding_dfb_24),
+                    ttl.dfb_descriptor(padding_dfb_25),
+                    ttl.dfb_descriptor(padding_dfb_26),
+                    ttl.dfb_descriptor(padding_dfb_27),
+                    ttl.dfb_descriptor(padding_dfb_28),
+                    ttl.dfb_descriptor(padding_dfb_29),
+                    ttl.dfb_descriptor(padding_dfb_30),
+                    ttl.dfb_descriptor(padding_dfb_31),
+                ],
+                unknown_dfb_access=True,
+            )
+            with initial_source.wait() as initial_block:
+                with before_reset.reserve() as before_reset_block:
+                    before_reset_block.store(initial_block)
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_source.wait() as current_source_block:
+                with before_reset.reserve() as after_reset_block:
+                    after_reset_block.store(current_source_block)
+            with before_reset.wait() as after_reset_block:
+                with current_output.reserve() as current_output_block:
+                    current_output_block.store(after_reset_block)
+
+        @ttl.datamovement(kernel=reader_kernel)
+        def read():
+            with initial_source.reserve() as initial_block:
+                ttl.copy(input_tensor[0, 0], initial_block).wait()
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_source.reserve() as current_source_block:
+                ttl.copy(input_tensor[0, 1], current_source_block).wait()
+
+        @ttl.datamovement(kernel=writer_kernel)
+        def write():
+            ttl.reset_dfbs(reset, dfbs=[before_reset])
+            with current_output.wait() as output_block:
+                ttl.copy(output_block, output_tensor[0, 0]).wait()
+
+    return synchronized_reset_kernel
+
+
+def _make_selected_reset_alias_domain_kernel(data_format):
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    reset = ttl.DFBReset(
+        participants=(compute_kernel, reader_kernel, writer_kernel),
+    )
+
+    @ttl.operation(grid=(2, 1))
+    def selected_reset_alias_domain_kernel(input_tensor, output_tensor):
+        selected_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+        crossing_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=1)
+
+        @ttl.datamovement(kernel=reader_kernel)
+        def read():
+            node_x, _ = ttl.node(dims=2)
+            if node_x == 0:
+                with selected_dfb.reserve() as selected_block:
+                    ttl.copy(input_tensor[0, 0], selected_block).wait()
+            if node_x == 1:
+                with crossing_dfb.reserve() as crossing_block:
+                    ttl.copy(input_tensor[0, 1], crossing_block).wait()
+            ttl.reset_dfbs(reset, dfbs=[selected_dfb])
+
+        @ttl.compute(kernel=compute_kernel)
+        def compute():
+            ttl.reset_dfbs(reset, dfbs=[selected_dfb])
+
+        @ttl.datamovement(kernel=writer_kernel)
+        def write():
+            node_x, _ = ttl.node(dims=2)
+            if node_x == 0:
+                with selected_dfb.wait() as selected_block:
+                    ttl.copy(selected_block, output_tensor[0, 0]).wait()
+            ttl.reset_dfbs(reset, dfbs=[selected_dfb])
+            if node_x == 1:
+                with crossing_dfb.wait() as crossing_block:
+                    ttl.copy(crossing_block, output_tensor[0, 1]).wait()
+
+    return selected_reset_alias_domain_kernel
+
+
 _repeated_bf16_atom_kernel = _make_repeated_dfb_atom_kernel("bf16")
 _repeated_f32_atom_kernel = _make_repeated_dfb_atom_kernel("float32")
 _in_place_bf16_atom_kernel = _make_in_place_atom_kernel("bf16")
@@ -855,6 +1184,197 @@ def test_dispatch_condition_reuses_dfbs_across_logical_kernels(
         assert_allclose(actual, expected, rtol=0.05, atol=1.0)
     else:
         assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"])
+@pytest.mark.parametrize("reset_all", [False, True], ids=["selected", "all"])
+@pytest.mark.parametrize("grid_cols", [1, 2], ids=["one-core", "two-core"])
+@pytest.mark.parametrize(
+    ("memory_config", "to_device"),
+    [("dram", to_dram), ("l1", to_l1)],
+    ids=["dram", "l1"],
+)
+def test_synchronized_reset_terminates_producer_epoch(
+    device,
+    dtype,
+    reset_all,
+    grid_cols,
+    memory_config,
+    to_device,
+    monkeypatch,
+    tmp_path,
+):
+    if ttl_api._detect_device_arch(device) != "blackhole":
+        pytest.skip("requires Blackhole DFB reset support")
+
+    data_format = "bf16" if dtype == torch.bfloat16 else "float32"
+    operation = _make_synchronized_reset_kernel(data_format, reset_all, grid_cols)
+
+    element_indices = torch.arange(
+        2 * TILE * TILE * grid_cols, dtype=torch.float32
+    ).reshape(TILE, 2 * TILE * grid_cols)
+    input_host = ((element_indices.remainder(257) - 128) / 64).to(dtype)
+    input_tensor = to_device(input_host, device)
+    output_host = torch.zeros(TILE, TILE * grid_cols, dtype=dtype)
+    output_tensor = to_device(output_host, device)
+
+    final_mlir_path = tmp_path / "synchronized_reset.mlir"
+    monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
+    for _invocation_index in range(2):
+        operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
+
+    # The producer-only DFB becomes canonical at the reset and shares with the
+    # following source. The compute-produced output retains a distinct index.
+    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
+    assert physical_dfb_count == 2
+
+    actual = ttnn.to_torch(output_tensor).float()
+    expected = input_host[:, TILE * grid_cols :].float()
+    if dtype == torch.bfloat16:
+        assert_allclose(actual, expected, rtol=0.05, atol=1.0)
+    else:
+        assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_synchronized_reset_executes_above_physical_index_31(
+    device, monkeypatch, tmp_path
+):
+    if ttl_api._detect_device_arch(device) != "blackhole":
+        pytest.skip("requires the Blackhole 64-index DFB capacity")
+
+    operation = _make_high_index_synchronized_reset_kernel("bf16")
+    final_mlir_path = tmp_path / "synchronized_reset_high_index.mlir"
+    monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
+
+    for invocation_index in range(2):
+        input_host = (
+            torch.arange(2 * TILE * TILE, dtype=torch.float32).reshape(TILE, 2 * TILE)
+            + invocation_index * 13
+        ).to(torch.bfloat16)
+        input_tensor = to_dram(input_host, device)
+        output_tensor = to_dram(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
+        operation(input_tensor, output_tensor, options="--no-ttl-reuse-user-dfbs")
+        assert_allclose(
+            ttnn.to_torch(output_tensor).float(),
+            input_host[:, TILE:].float(),
+            rtol=0.05,
+            atol=1.0,
+        )
+
+    final_mlir = final_mlir_path.read_text()
+    assert "dfb_index = 33 : i32" in final_mlir
+    assert "get_compile_time_arg_val(33)" in final_mlir
+    assert "value = 2 : i32" in final_mlir
+    assert "experimental::reset_dfb_interfaces" in final_mlir
+
+
+@pytest.mark.parametrize(
+    ("data_format", "ttnn_dtype", "torch_dtype", "tile", "compute_interface"),
+    [
+        ("bfp_bf4", ttnn.bfloat4_b, torch.bfloat16, (8, 32), False),
+        ("uint8", ttnn.uint8, torch.uint8, (1, 16), False),
+        ("bfp_bf4", ttnn.bfloat4_b, torch.bfloat16, (32, 32), True),
+        ("uint16", ttnn.uint16, torch.uint16, (16, 32), True),
+    ],
+    ids=[
+        "bfp4-8x32-dm",
+        "uint8-1x16-dm",
+        "bfp4-32x32-compute",
+        "uint16-16x32-compute",
+    ],
+)
+@pytest.mark.parametrize(
+    "memory_config",
+    [ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG],
+    ids=["dram", "l1"],
+)
+def test_synchronized_reset_supports_packed_and_integer_subtiles(
+    device,
+    data_format,
+    ttnn_dtype,
+    torch_dtype,
+    tile,
+    compute_interface,
+    memory_config,
+):
+    if ttl_api._detect_device_arch(device) != "blackhole":
+        pytest.skip("requires Blackhole DFB reset support")
+
+    operation = (
+        _make_compute_interface_reset_kernel(data_format, tile)
+        if compute_interface
+        else _make_synchronized_reset_kernel(
+            data_format,
+            reset_all=False,
+            tile=tile,
+            use_compute_passthrough=False,
+        )
+    )
+    tile_height, tile_width = tile
+    input_host = (
+        torch.arange(2 * tile_height * tile_width, dtype=torch.int64)
+        .remainder(127)
+        .reshape(tile_height, 2 * tile_width)
+        .to(torch_dtype)
+    )
+    input_tensor = ttnn.from_torch(
+        input_host,
+        dtype=ttnn_dtype,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        tile=ttnn.Tile(tile),
+        memory_config=memory_config,
+    )
+    output_tensor = ttnn.from_torch(
+        torch.zeros((tile_height, tile_width), dtype=torch_dtype),
+        dtype=ttnn_dtype,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        tile=ttnn.Tile(tile),
+        memory_config=memory_config,
+    )
+    expected = ttnn.to_torch(input_tensor).reshape(tile_height, 2 * tile_width)[
+        :, tile_width:
+    ]
+
+    for _invocation_index in range(2):
+        operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
+
+    actual = ttnn.to_torch(output_tensor).reshape(tile)
+    if torch_dtype == torch.uint8:
+        assert torch.equal(actual.to(torch.int64), expected.to(torch.int64))
+    else:
+        assert_allclose(actual.float(), expected.float(), rtol=0.0, atol=0.0)
+
+
+def test_selected_reset_preserves_non_target_live_aliases(
+    device, monkeypatch, tmp_path
+):
+    if ttl_api._detect_device_arch(device) != "blackhole":
+        pytest.skip("requires Blackhole DFB reset support")
+
+    operation = _make_selected_reset_alias_domain_kernel("bf16")
+    input_host = (
+        torch.arange(2 * TILE * TILE, dtype=torch.float32)
+        .reshape(TILE, 2 * TILE)
+        .to(torch.bfloat16)
+    )
+    input_tensor = to_dram(input_host, device)
+    output_tensor = to_dram(torch.zeros_like(input_host), device)
+    final_mlir_path = tmp_path / "selected_reset_alias_domain.mlir"
+    monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
+
+    for _invocation_index in range(2):
+        operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
+
+    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
+    assert physical_dfb_count == 2
+    assert_allclose(
+        ttnn.to_torch(output_tensor).float(),
+        input_host.float(),
+        rtol=0.05,
+        atol=1.0,
+    )
 
 
 @pytest.mark.parametrize(

@@ -75,6 +75,7 @@ enum class DFBConflictReason {
   TransactionMismatch,
   PointerOwnerMismatch,
   ConcurrentLifetime,
+  ResetDomainWrite,
   StaticConfigurationMismatch,
 };
 
@@ -158,6 +159,7 @@ public:
   DFBPhysicalAllocationPlanner(
       Operation *operation, bool reuseUserDFBs,
       std::uint64_t exactColoringSearchStateLimit,
+      std::optional<uint64_t> l1BudgetOverride,
       ArrayRef<DFBStaticConfigurationConflict> staticConfigurationConflicts,
       AnalysisManager analysisManager);
 

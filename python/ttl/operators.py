@@ -29,6 +29,7 @@ from .constants import DEFAULT_TILE_SIZE
 from .kernel import ExternalKernelSelection, ReleaseKernelSelection
 from .pipe import Pipe
 from .scalar import ScalarType
+from .dfb_reset import DFBReset
 
 
 def call_extern_func(
@@ -80,8 +81,27 @@ def call_extern_func(
     ``condition_result`` declares that the result evaluates one immutable
     dispatch-stable condition. Its scalar type comes from the declaration. The
     call must be repeat-safe and cannot access DFB state.
+
     """
     raise RuntimeError("ttl.call_extern_func() is valid only in a compiled kernel")
+
+
+def reset_dfbs(reset: DFBReset, /, *, dfbs) -> None:
+    """Synchronize DFB interface owners and reset the listed interfaces.
+
+    The operation restores pointer, initialization, and occupancy state to an
+    empty queue. It preserves descriptor configuration and payload bytes. It
+    makes each participating data movement RISC drain its own outstanding NoC
+    commands before publishing boundary arrival. It cannot complete commands
+    issued by another core or a non-participating RISC, so every producer must
+    issue its required transfers before its local reset occurrence.
+    """
+    raise RuntimeError("ttl.reset_dfbs() is valid only in a compiled kernel")
+
+
+def reset_all_dfbs(reset: DFBReset, /) -> None:
+    """Apply ``reset_dfbs`` semantics to every worker-local DFB interface."""
+    raise RuntimeError("ttl.reset_all_dfbs() is valid only in a compiled kernel")
 
 
 class DFBEffect:

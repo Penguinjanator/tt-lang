@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -65,6 +66,19 @@ public:
            ++rhsIndex) {
         addPairConflicts(model, liveness, lhsIndex, rhsIndex);
       }
+    }
+    for (const DFBResetAllocationConflict &conflict :
+         liveness.getResetAllocationConflicts()) {
+      unsigned targetIndex = conflict.targetLogicalIndex;
+      unsigned overlappingIndex = conflict.overlappingLogicalIndex;
+      if (targetIndex == overlappingIndex ||
+          model.adjacency[targetIndex].test(overlappingIndex)) {
+        continue;
+      }
+      addEvidence(model, logicalDFBs[targetIndex],
+                  logicalDFBs[overlappingIndex], targetIndex, overlappingIndex,
+                  DFBConflictReason::ResetDomainWrite, conflict.node,
+                  conflict.resetOperation, conflict.overlappingOperation);
     }
     DenseMap<int64_t, unsigned> logicalIndexById;
     for (auto [logicalIndex, logicalDFB] : llvm::enumerate(logicalDFBs)) {
@@ -169,30 +183,52 @@ private:
                     getLifetimeEvidence(rhsLifetime, rhs));
         continue;
       }
-      if (lhsLifetime->transactionRuns != rhsLifetime->transactionRuns) {
+      bool lhsBeforeRhs =
+          useConditionalProof
+              ? liveness.isConditionallyOrderedBefore(lhsIndex, rhsIndex, node)
+              : liveness.isOrderedBefore(lhsIndex, rhsIndex, node);
+      bool rhsBeforeLhs =
+          useConditionalProof
+              ? liveness.isConditionallyOrderedBefore(rhsIndex, lhsIndex, node)
+              : liveness.isOrderedBefore(rhsIndex, lhsIndex, node);
+      const DFBPerNodeLifetime *before =
+          lhsBeforeRhs ? lhsLifetime : rhsLifetime;
+      const DFBPerNodeLifetime *after =
+          lhsBeforeRhs ? rhsLifetime : lhsLifetime;
+      bool terminalStateCompatible = false;
+      bool pointerOwnersCompatible = false;
+      if (lhsBeforeRhs || rhsBeforeLhs) {
+        terminalStateCompatible =
+            before->terminalStateCanonical ||
+            before->terminalTransactionRuns == after->transactionRuns;
+        pointerOwnersCompatible =
+            before->terminalStateCanonical ||
+            (before->terminalWritePointerOwner == after->writePointerOwner &&
+             before->terminalReadPointerOwner == after->readPointerOwner);
+      } else {
+        // Preserve the more specific state diagnosis when lifetimes are also
+        // unordered; ordering alone must not obscure a protocol mismatch.
+        terminalStateCompatible =
+            lhsLifetime->transactionRuns == rhsLifetime->transactionRuns;
+        pointerOwnersCompatible =
+            lhsLifetime->writePointerOwner == rhsLifetime->writePointerOwner &&
+            lhsLifetime->readPointerOwner == rhsLifetime->readPointerOwner;
+      }
+      if (!terminalStateCompatible) {
         addEvidence(model, lhs, rhs, lhsIndex, rhsIndex,
                     DFBConflictReason::TransactionMismatch, node,
                     getLifetimeEvidence(lhsLifetime, lhs),
                     getLifetimeEvidence(rhsLifetime, rhs));
         continue;
       }
-      if (lhsLifetime->writePointerOwner != rhsLifetime->writePointerOwner ||
-          lhsLifetime->readPointerOwner != rhsLifetime->readPointerOwner) {
+      if (!pointerOwnersCompatible) {
         addEvidence(model, lhs, rhs, lhsIndex, rhsIndex,
                     DFBConflictReason::PointerOwnerMismatch, node,
                     getLifetimeEvidence(lhsLifetime, lhs),
                     getLifetimeEvidence(rhsLifetime, rhs));
         continue;
       }
-      bool ordered =
-          useConditionalProof
-              ? liveness.isConditionallyOrderedBefore(lhsIndex, rhsIndex,
-                                                      node) ||
-                    liveness.isConditionallyOrderedBefore(rhsIndex, lhsIndex,
-                                                          node)
-              : liveness.isOrderedBefore(lhsIndex, rhsIndex, node) ||
-                    liveness.isOrderedBefore(rhsIndex, lhsIndex, node);
-      if (!ordered) {
+      if (!lhsBeforeRhs && !rhsBeforeLhs) {
         addEvidence(model, lhs, rhs, lhsIndex, rhsIndex,
                     DFBConflictReason::ConcurrentLifetime, node,
                     getLifetimeEvidence(lhsLifetime, lhs),
@@ -601,14 +637,15 @@ static void setInvalidDFBPageSizeFailure(CircularBufferType dfbType,
 
 /// Returns the L1 bytes required by the unique physical assignments.
 static FailureOr<uint64_t>
-computeAllocationBytes(ArrayRef<DFBPhysicalIndexAssignment> assignments,
+computeAllocationBytes(ModuleOp moduleOp,
+                       ArrayRef<DFBPhysicalIndexAssignment> assignments,
                        std::string &failureReason) {
   DFBAllocationFootprint footprint;
   for (const DFBPhysicalIndexAssignment &assignment : assignments) {
     if (assignment.tensorBacking) {
       continue;
     }
-    if (failed(footprint.add(assignment.physicalIndex,
+    if (failed(footprint.add(moduleOp, assignment.physicalIndex,
                              cast<CircularBufferType>(assignment.type),
                              failureReason))) {
       return failure();
@@ -617,11 +654,14 @@ computeAllocationBytes(ArrayRef<DFBPhysicalIndexAssignment> assignments,
   return footprint.getTotalBytes();
 }
 
-/// Recomputes an assignment with the minimum physical-index count only when a
-/// valid first-fit assignment exceeds the L1 budget. Both user-reuse policies
-/// therefore share identical search and diagnostic behavior.
+/// Recomputes an assignment with the minimum physical-index count when a valid
+/// first-fit assignment exceeds either the authoritative DFB-plus-reset budget
+/// or the provisional threshold after a conservative PipeNet reservation. The
+/// reservation only triggers search; finalization rejects against the
+/// authoritative budget, and conversion validates exact PipeNet resources.
 static FailureOr<PhysicalAllocationCandidate> computeAllocationWithinL1(
     ModuleOp moduleOp, std::uint64_t exactColoringSearchStateLimit,
+    std::optional<uint64_t> l1BudgetOverride,
     DFBAnalysisFailure &analysisFailure,
     llvm::function_ref<FailureOr<PhysicalAllocationCandidate>(bool)>
         computeAllocation) {
@@ -633,36 +673,76 @@ static FailureOr<PhysicalAllocationCandidate> computeAllocationWithinL1(
 
   std::string allocationSizeFailureReason;
   FailureOr<uint64_t> allocationBytes = computeAllocationBytes(
-      allocation->assignments, allocationSizeFailureReason);
+      moduleOp, allocation->assignments, allocationSizeFailureReason);
   if (failed(allocationBytes)) {
     analysisFailure.set(moduleOp, allocationSizeFailureReason);
     return failure();
   }
-  uint64_t l1BudgetBytes = getUsableDFBL1Bytes(moduleOp);
-  if (*allocationBytes > l1BudgetBytes && !allocation->minimumProven) {
+  FailureOr<uint64_t> resetStateBytes =
+      getSynchronizedDFBResetStateAllocationBytes(moduleOp);
+  if (failed(resetStateBytes)) {
+    analysisFailure.set(moduleOp,
+                        "failed to compute synchronized-reset scratch size");
+    return failure();
+  }
+  uint64_t l1BudgetBytes = getUsableDFBL1Bytes(moduleOp, l1BudgetOverride);
+  if (*resetStateBytes > l1BudgetBytes) {
+    std::string message;
+    llvm::raw_string_ostream messageStream(message);
+    messageStream << "synchronized-reset scratch requires " << *resetStateBytes
+                  << " L1 bytes but the budget is " << l1BudgetBytes;
+    analysisFailure.set(moduleOp, messageStream.str());
+    return failure();
+  }
+  uint64_t dfbBudgetBytes = l1BudgetBytes - *resetStateBytes;
+  uint64_t minimumSearchTriggerBytes = dfbBudgetBytes;
+  if (auto pipeReservation = moduleOp->getAttrOfType<IntegerAttr>(
+          kPipeConservativeL1BytesAttrName)) {
+    if (pipeReservation.getValue().isNegative()) {
+      analysisFailure.set(moduleOp,
+                          "conservative PipeNet L1 reservation is negative");
+      return failure();
+    }
+    uint64_t pipeBytes = pipeReservation.getValue().getZExtValue();
+    minimumSearchTriggerBytes = pipeBytes > minimumSearchTriggerBytes
+                                    ? 0
+                                    : minimumSearchTriggerBytes - pipeBytes;
+  }
+  if (*allocationBytes > minimumSearchTriggerBytes &&
+      !allocation->minimumProven) {
     allocation = computeAllocation(/*requireMinimum=*/true);
     if (failed(allocation)) {
       return failure();
     }
-    allocationBytes = computeAllocationBytes(allocation->assignments,
+    allocationBytes = computeAllocationBytes(moduleOp, allocation->assignments,
                                              allocationSizeFailureReason);
     if (failed(allocationBytes)) {
       analysisFailure.set(moduleOp, allocationSizeFailureReason);
       return failure();
     }
   }
-  if (allocation->exactSearchLimitReached) {
+  if (allocation->exactSearchLimitReached &&
+      *allocationBytes > dfbBudgetBytes) {
     setExactSearchLimitFailure(moduleOp, allocation->physicalDFBCount,
                                allocation->exactSearchStateCount,
                                exactColoringSearchStateLimit,
                                "the target L1 budget", analysisFailure);
     return failure();
   }
-  if (*allocationBytes > l1BudgetBytes) {
+  if (*allocationBytes > dfbBudgetBytes) {
+    std::optional<uint64_t> combinedBytes =
+        llvm::checkedAddUnsigned(*allocationBytes, *resetStateBytes);
+    if (!combinedBytes) {
+      analysisFailure.set(
+          moduleOp, "combined DFB and reset allocation is not representable");
+      return failure();
+    }
     std::string message;
     llvm::raw_string_ostream messageStream(message);
-    messageStream << "DFB allocation requires " << *allocationBytes
-                  << " L1 bytes but the target supports " << l1BudgetBytes;
+    messageStream << "DFB and synchronized-reset allocation requires "
+                  << *combinedBytes << " L1 bytes but the budget is "
+                  << l1BudgetBytes << " (DFB=" << *allocationBytes
+                  << ", reset scratch=" << *resetStateBytes << ")";
     analysisFailure.set(moduleOp, messageStream.str());
     return failure();
   }
@@ -833,6 +913,7 @@ validateTensorBackingRanges(ArrayRef<DFBPhysicalIndexAssignment> assignments,
 DFBPhysicalAllocationPlanner::DFBPhysicalAllocationPlanner(
     Operation *operation, bool reuseUserDFBs,
     std::uint64_t exactColoringSearchStateLimit,
+    std::optional<uint64_t> l1BudgetOverride,
     ArrayRef<DFBStaticConfigurationConflict> staticConfigurationConflicts,
     AnalysisManager analysisManager) {
   ModuleOp moduleOp = cast<ModuleOp>(operation);
@@ -876,9 +957,9 @@ DFBPhysicalAllocationPlanner::DFBPhysicalAllocationPlanner(
         moduleOp, liveness, plan.conflictModel, *targetCapacity,
         analysisFailure, exactColoringSearchStateLimit, requireMinimum);
   };
-  FailureOr<PhysicalAllocationCandidate> allocation =
-      computeAllocationWithinL1(moduleOp, exactColoringSearchStateLimit,
-                                analysisFailure, computeAllocation);
+  FailureOr<PhysicalAllocationCandidate> allocation = computeAllocationWithinL1(
+      moduleOp, exactColoringSearchStateLimit, l1BudgetOverride,
+      analysisFailure, computeAllocation);
   if (failed(allocation)) {
     errorOperation = analysisFailure.operation;
     errorMessage = std::move(analysisFailure.message);

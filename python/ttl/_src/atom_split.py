@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, Union
 
+from ttl.dfb_reset import DFBReset, _BoundDFBReset
 from ttl.kernel import (
     Kernel,
     KernelKind,
@@ -33,6 +34,7 @@ from ttl.kernel import (
 
 _EXTERNAL_CALL_NAME = "call_extern_func"
 _KERNEL_KEYWORD = "kernel"
+_DFB_RESET_CALLS = frozenset({"reset_dfbs", "reset_all_dfbs"})
 _PIPE_SOURCE_KERNEL = Kernel._implicit(
     KernelKind.DATA_MOVEMENT,
     _PIPE_SOURCE_KERNEL_ROLE,
@@ -152,6 +154,13 @@ def _kernel_keyword(call: ast.Call) -> Optional[ast.expr]:
     return None
 
 
+def _keyword_value(call: ast.Call, name: str) -> Optional[ast.expr]:
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+    return None
+
+
 def _is_kernel_kind_union(node: ast.AST) -> bool:
     return isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
 
@@ -213,6 +222,37 @@ class _KernelSelectorResolver:
                 f"selection ({_format_kernels(inferred_kernels)})",
             )
         return selected
+
+    def resolve_reset(self, call: ast.Call) -> FrozenSet[KernelSelector]:
+        if len(call.args) != 1:
+            raise _split_error(
+                call, f"{ast.unparse(call.func)} requires one DFBReset argument"
+            )
+        reset_node = call.args[0]
+        reset = self._resolve_reference(reset_node)
+        if isinstance(reset, _BoundDFBReset):
+            participants = reset.participants
+        elif isinstance(reset, DFBReset):
+            participants = reset.participants
+        else:
+            type_detail = ""
+            if reset is not _MISSING_SELECTOR_VALUE:
+                type_detail = f", got {type(reset).__name__}"
+            raise _split_error(
+                reset_node,
+                f"{ast.unparse(call.func)} reset must be a DFBReset captured by "
+                f"the enclosing operation{type_detail}",
+            )
+        for participant in participants:
+            if participant._implicit_role is None and not any(
+                participant is kernel for kernel in self.logical_kernels.values()
+            ):
+                raise _split_error(
+                    reset_node,
+                    "DFBReset participant Kernel must be declared by the "
+                    "enclosing operation",
+                )
+        return frozenset(participants)
 
     def resolve_release(self, call: ast.Call) -> Optional[KernelSelector]:
         selector = _kernel_keyword(call)
@@ -332,6 +372,8 @@ def _classify_ttl_call(
         receiver = func.value.id
         name = func.attr
         if receiver == "ttl":
+            if name in _DFB_RESET_CALLS:
+                return selector_resolver.resolve_reset(call)
             classification = _TTL_OPS.get(name)
             if classification is None:
                 raise _split_error(

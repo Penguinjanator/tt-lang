@@ -148,6 +148,11 @@ constexpr llvm::StringLiteral
     kPipeGlobalSemaphoreCountAttrName("ttl.pipe_global_semaphore_count");
 constexpr llvm::StringLiteral
     kPipeSramScratchBytesAttrName("ttl.pipe_sram_scratch_bytes");
+constexpr llvm::StringLiteral
+    kPipeConservativeL1BytesAttrName("ttl.pipe_conservative_l1_bytes");
+
+/// Module attribute carrying the number of synchronized DFB resets.
+constexpr llvm::StringLiteral kDFBResetCountAttrName("ttl.dfb_reset_count");
 
 /// Function attribute listing receiver DFB indices whose L1 base addresses are
 /// passed after tensor buffer addresses as common runtime arguments.

@@ -82,12 +82,14 @@ convert-ttl-to-compute         (FuncOp)   Lower remaining tensor ops
 ttl-insert-cb-sync             (FuncOp)   Insert remaining DFB synchronization
 ttl-verify-pipenet-guards      (Module)   Verify PipeNet launch-node domains
 ttl-verify-pipenet-schedule    (Module)   Verify PipeNet event ordering
+ttl-form-pipe-transports       (Module)   Group eligible repeated transfers
 ttl-coalesce-dfb-acquires      (FuncOp)   Coalesce adjacent DFB acquisitions
 ttl-finalize-dfb-indices       (Module)   Finalize identities and allocations
 ttl-set-compute-kernel-config  (ModuleOp) Resolve per-kernel configuration
   ... DST assignment, loop lowering, scheduling ...
 ttl-annotate-cb-associations   (FuncOp)   Copy CB indices to tile ops
 ttl-verify-dfb-spsc            (Module)   Reject DFBs shared across threads
+ttl-validate-cb-budget         (Module)   Validate static DFB and reset storage
 convert-ttl-to-ttkernel        (Module)   Lower to TTKernel dialect
 ttkernel-insert-inits          (Module)   Insert hardware init calls
 ```
@@ -110,6 +112,91 @@ allocation.
 pass requires the `ttl.dfb_allocations` module attribute emitted by successful
 finalization, then verifies that every declaration and lifecycle operand has a
 resolved logical ID.
+
+## Synchronized reset epochs
+
+Completing one DFB transaction leaves its hardware read and write pointers at
+their advanced ring positions. A later logical lifecycle cannot assume that a
+reused physical index starts at its descriptor base, even when the earlier
+lifecycle has zero occupancy. This prevents the compiler from assigning the
+same physical index to otherwise disjoint lifecycles that require canonical
+interface state.
+
+`DFBReset` identifies one worker-local synchronization boundary and its logical
+kernel participants. The built-in operations select either explicit DFBs or
+every DFB allocated by the program:
+
+```python
+def make_reset_operation():
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    reset_boundary = ttl.DFBReset(
+        participants=(compute_kernel, reader_kernel, writer_kernel)
+    )
+
+    @ttl.operation(grid=(1, 1))
+    def reset_operation(input_tensor):
+        scratch = ttl.make_dfb("bf16", shape=(1, 1), block_count=2)
+
+        @ttl.compute(kernel=compute_kernel)
+        def compute():
+            ttl.reset_dfbs(reset_boundary, dfbs=[scratch])
+
+        @ttl.datamovement(kernel=reader_kernel)
+        def read():
+            ttl.reset_dfbs(reset_boundary, dfbs=[scratch])
+
+        @ttl.datamovement(kernel=writer_kernel)
+        def write():
+            ttl.reset_dfbs(reset_boundary, dfbs=[scratch])
+
+    return reset_operation
+
+
+reset_operation = make_reset_operation()
+```
+
+The same `DFBReset` value identifies the three occurrences as one dynamic
+boundary. `ttl.reset_all_dfbs(reset_boundary)` provides the same boundary for
+every allocated physical DFB index. A declaration contains exactly one compute
+kernel and two data movement kernels, and it executes at most once per dispatch
+and launch node. Conditional occurrences must use equivalent structured
+conditions on all participants.
+
+The compiler treats the interval before the first reset, each interval between
+resets, and the interval after the last reset as separate allocation epochs.
+An epoch is an analysis interval; the compiler does not emit an epoch object.
+The liveness analysis proves that every selected DFB has either a balanced
+protocol lifecycle or bounded producer-only occupancy before the boundary,
+that no pre-reset payload is consumed afterward, and that every participant
+selects the same DFB set. The reset discards producer-only occupancy and
+terminates the old lifecycle at canonical empty state. A later lifecycle can
+then reuse the physical index when its launch-node domain, storage, element
+type, and other allocation constraints are compatible. Missing participants,
+repeated dynamic instances, mismatched conditions or target sets, incomplete
+transactions, and unordered boundaries are compilation errors.
+
+On Blackhole, `convert-ttl-to-ttkernel` lowers each occurrence to
+`experimental::reset_dfb_interfaces(state_address, low_mask, high_mask)` from
+[`experimental_dfb_reset.h`](../../include/ttlang/Target/TTKernel/LLKs/experimental_dfb_reset.h).
+The compiler reserves one 16-byte synchronization record per declaration after
+PipeNet scratch storage. The combined allocation is rounded to the runtime L1
+allocation quantum, included in transport selection and DFB budget validation,
+and initialized to zero by the host. DM1 coordinates DM0, UNPACK, and PACK
+through distinct L1 state words. Each participating data movement RISC drains
+its own outstanding NoC commands before publishing arrival. UNPACK and PACK
+wait for their previously issued interface commands to retire. After entry
+synchronization, the selected interface owners reset their read pointer, write
+pointer, packer write-tile pointer, initialization state, and stream occupancy
+counters. An exit synchronization completes before any owner returns. MATH
+executes a no-op because it does not own DFB interface state.
+
+The operation does not clear payload bytes, change descriptor configuration,
+or complete NoC commands issued by another core or a non-participating RISC.
+Every producer must issue its required transfers before its local boundary
+occurrence; the participating data movement RISC then completes its own
+outstanding commands. Runtime lowering is currently restricted to Blackhole.
 
 ## DFB Lifecycle
 
@@ -1641,14 +1728,19 @@ buildPhysicalAllocationPlan(module, logicalIdentities, perNodeLifetimes):
   verify every pair assigned one index against the typed conflict model
 
   aggregate L1 bytes once per unique physical index
-  if assignment exceeds the L1 limit and is not known minimum:
+  authoritativeDFBBudget = L1 limit - synchronized-reset scratch
+  minimumSearchTrigger = authoritativeDFBBudget
+      - provisional conservative PipeNet reservation
+  if assignment exceeds minimumSearchTrigger and is not known minimum:
     minimumResult = exactMinimumIndexSearch(
         conflicts, pairwiseConflictLowerBound, searchStateLimit)
-    if minimumResult is SearchLimitReached:
+    if minimumResult is SearchLimitReached and
+        assignment exceeds authoritativeDFBBudget:
       reject with an inconclusive-search diagnostic
-    assignment = minimumResult.assignment
+    if minimumResult found an assignment:
+      assignment = minimumResult.assignment
     aggregate L1 bytes once per unique physical index
-  reject if the assignment exceeds the L1 limit
+  reject if the assignment exceeds authoritativeDFBBudget
   build one runtime descriptor for every physical index
   reject conflicting descriptors at one physical index
   reject if the internal assignment is not a dense zero-based range
@@ -1667,19 +1759,29 @@ applyPhysicalAllocationPlan(module, plan):
 ```
 
 First-fit is accepted whenever its valid assignment satisfies the physical
-index and L1 limits; proving a smaller assignment would not change compilation.
-Backtracking can grow exponentially, so exact search is reserved for cases
-where first-fit prevents acceptance. A physical-index failure asks one direct
+index limit and the provisional L1 search threshold; proving a smaller
+assignment would not change compilation. Backtracking can grow exponentially,
+so exact search is reserved for cases where first-fit prevents acceptance or
+exceeds that provisional threshold. A physical-index failure asks one direct
 question at the available index count instead of proving the minimum. A valid
-assignment that exceeds L1 requires a minimum physical-index-count search
-because a different sharing assignment may use less physical storage. Each
-exact query examines at most `exact-coloring-search-limit` deterministic states,
-which defaults to 1,000,000, to bound compile time. Reaching the limit reports
-that feasibility was not proved and identifies the option that increases the
-limit; it never reports a proved capacity failure. The planner completes every
+assignment that exceeds the authoritative DFB-plus-reset budget requires a
+minimum physical-index-count search because a different sharing assignment may
+use less physical storage. Each exact query examines at most
+`exact-coloring-search-limit` deterministic states, which defaults to
+1,000,000, to bound compile time. Reaching the limit reports that feasibility
+was not proved and identifies the option that increases the limit; it never
+reports a proved capacity failure. The planner completes every
 diagnostic-producing validation before `TTLFinalizeDFBIndices` changes any
 `dfb_id`, `cb_index`, kernel attribute, or module attribute. The finalizer only
 materializes the validated plan.
+
+Transport formation may record a conservative PipeNet L1 reservation before
+finalization. That reservation lowers the threshold that triggers minimum-index
+search, so finalization can select a smaller DFB assignment before exact PipeNet
+planning. It is not an authoritative rejection condition: finalization rejects
+only when DFB storage plus synchronized-reset scratch exceeds L1. Conversion
+then validates finalized DFB storage against the exact PipeNet scratch and
+GlobalSemaphore requirements.
 
 Finalization is idempotent on unchanged finalized IR. Reanalysis reconstructs
 the same logical identities, typed conflicts, physical indices, descriptors,
@@ -1907,11 +2009,15 @@ with releases before finalization.
 - **Pressure above the unspilled limits.** Deterministic first-fit is accepted
   when it fits because a smaller assignment would not change acceptance. One
   fixed-limit exhaustive query runs when first-fit exceeds the physical-index
-  limit. Minimum physical-index-count search runs only when a valid assignment
-  exceeds the L1 budget. Each query is limited to 1,000,000 deterministic
-  states by default so difficult graphs cannot make compile time unbounded.
-  Limit exhaustion reports an inconclusive allocation; proven infeasibility
-  reports a capacity failure. DRAM spilling is tracked by
+  limit. Minimum physical-index-count search also runs when a valid assignment
+  exceeds the DFB-plus-reset L1 budget or a provisional threshold that reserves
+  conservative PipeNet resources. Only the DFB-plus-reset budget is
+  authoritative during finalization; exact combined resources are validated
+  during conversion. Each query is limited to 1,000,000 deterministic states by
+  default so difficult graphs cannot make compile time unbounded. Limit
+  exhaustion reports an inconclusive allocation only when acceptance requires
+  the search result; proven infeasibility reports a capacity failure. DRAM
+  spilling is tracked by
   [#809](https://github.com/tenstorrent/tt-lang/issues/809).
 
 - **Reachability cost.** Each launch node runs one graph traversal from every

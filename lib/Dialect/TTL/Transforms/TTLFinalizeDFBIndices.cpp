@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "DFBAllocationLimits.h"
 #include "DFBPhysicalAllocationPlan.h"
 #include "ttlang/Dialect/TTL/IR/TTL.h"
 #include "ttlang/Dialect/TTL/IR/TTLOpsUtils.h"
@@ -146,6 +147,10 @@ struct TTLFinalizeDFBIndicesPass
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (failed(validateSynchronizedDFBResetTarget(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
     const DFBLogicalIdentityAnalysis &logicalIdentityAnalysis =
         getAnalysis<DFBLogicalIdentityAnalysis>();
     if (!logicalIdentityAnalysis.succeeded()) {
@@ -167,6 +172,8 @@ struct TTLFinalizeDFBIndicesPass
     }
     DFBPhysicalAllocationPlanner allocationPlanner(
         moduleOp, reuseUserDFBs, exactColoringSearchStateLimit,
+        l1BudgetOverride == 0 ? std::nullopt
+                              : std::optional<uint64_t>(l1BudgetOverride),
         *staticConfigurationConflicts, getAnalysisManager());
     if (!allocationPlanner.succeeded()) {
       Operation *errorOperation = allocationPlanner.getErrorOperation();
@@ -185,6 +192,7 @@ struct TTLFinalizeDFBIndicesPass
 
     OpBuilder builder(moduleOp.getContext());
     applyPhysicalAllocationPlan(moduleOp, builder, allocationPlan);
+    moduleOp->removeAttr(kPipeConservativeL1BytesAttrName);
   }
 };
 

@@ -21,13 +21,16 @@
 #include "ttlang/Dialect/TTL/IR/TTLOpsUtils.h"
 #include "ttlang/Dialect/Utils/OpaqueCallVerifyUtils.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/TypeSwitch.h" // IWYU pragma: keep
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <string>
+#include <tuple>
 
 #include "ttlang/Dialect/TTL/IR/TTLInterfaces.cpp.inc"
 
@@ -82,6 +85,66 @@ llvm::LogicalResult DispatchConditionAttr::verify(
            << "dispatch condition scalar type must be signless i32 or i64";
   }
   return success();
+}
+
+llvm::LogicalResult SynchronizedDFBResetAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError, int64_t ordinal,
+    ArrayRef<LogicalKernelAttr> participants) {
+  if (ordinal < 0) {
+    return emitError() << "synchronized DFB reset ordinal must be nonnegative";
+  }
+  if (participants.empty()) {
+    return emitError()
+           << "synchronized DFB reset requires at least one participant";
+  }
+  llvm::DenseSet<Attribute> uniqueParticipants;
+  unsigned computeCount = 0;
+  unsigned dataMovementCount = 0;
+  for (LogicalKernelAttr participant : participants) {
+    if (!uniqueParticipants.insert(participant).second) {
+      return emitError()
+             << "synchronized DFB reset participants must be distinct";
+    }
+    if (participant.getKind() == LogicalKernelKind::Compute) {
+      ++computeCount;
+    } else if (participant.getKind() == LogicalKernelKind::DataMovement) {
+      ++dataMovementCount;
+    }
+  }
+  if (computeCount != 1 || dataMovementCount != 2) {
+    return emitError() << "synchronized DFB reset participants must contain "
+                          "one compute kernel and two data movement kernels";
+  }
+  auto participantKey = [](LogicalKernelAttr participant) {
+    int identityKind = 0;
+    if (participant.getIdentity()) {
+      identityKind = participant.getRole() ? 1 : 2;
+    }
+    auto valueOrEmpty = [](StringAttr value) {
+      return value ? value.getValue() : StringRef();
+    };
+    return std::make_tuple(static_cast<unsigned>(participant.getKind()),
+                           identityKind,
+                           valueOrEmpty(participant.getIdentity()),
+                           valueOrEmpty(participant.getOperation()),
+                           valueOrEmpty(participant.getRole()));
+  };
+  if (!std::is_sorted(participants.begin(), participants.end(),
+                      [&](LogicalKernelAttr lhs, LogicalKernelAttr rhs) {
+                        return participantKey(lhs) < participantKey(rhs);
+                      })) {
+    return emitError()
+           << "synchronized DFB reset participants must use canonical order";
+  }
+  return success();
+}
+
+SynchronizedDFBResetAttr SynchronizedDFBResetAttr::getCheckedInstance(
+    Location location, MLIRContext *context, int64_t ordinal,
+    ArrayRef<LogicalKernelAttr> participants) {
+  return SynchronizedDFBResetAttr::getChecked(
+      [location]() { return emitError(location); }, context, ordinal,
+      participants);
 }
 
 void TTLDialect::registerAttributes() {
@@ -2644,6 +2707,19 @@ mlir::LogicalResult mlir::tt::ttl::OpaqueCallOp::verify() {
     if (!getTemplateDfbOperands().empty() || !dependencies.empty() ||
         getDfbEffects() || getUnknownDfbAccess()) {
       return emitOpError("condition result call cannot access DFB state");
+    }
+  }
+  return success();
+}
+
+mlir::LogicalResult mlir::tt::ttl::ResetDFBsOp::verify() {
+  if (getDfbs().empty()) {
+    return emitOpError("requires at least one DFB");
+  }
+  llvm::DenseSet<Value> uniqueDFBs;
+  for (Value dfb : getDfbs()) {
+    if (!uniqueDFBs.insert(dfb).second) {
+      return emitOpError("DFBs must be distinct");
     }
   }
   return success();

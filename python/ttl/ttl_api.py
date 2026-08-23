@@ -12,6 +12,7 @@ import inspect
 import os
 import random
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Union
@@ -95,6 +96,12 @@ from .condition import (
     _bind_current_dispatch_condition,
     _dispatch_condition_binding_scope,
 )
+from .dfb_reset import (
+    DFBReset,
+    _BoundDFBReset,
+    _bind_current_dfb_reset,
+    _dfb_reset_binding_scope,
+)
 from .constants import SUPPORTED_MEMORY_SPACES, validate_math_fidelity
 from .diagnostics import (
     TTLangCompileError,
@@ -107,7 +114,11 @@ from .dtype_utils import (
     torch_dtype_to_ttnn_datatype,
 )
 from .kernel_runner import (
+    _same_device,
+    attach_runtime_resource_finalizer,
+    KernelRuntimeResourceCache,
     KernelSpec,
+    get_min_remaining_l1_excluding_cached_resources,
     get_min_remaining_l1_for_device,
     run_kernel_on_device,
     emit_runner_file,
@@ -284,7 +295,7 @@ def _make_cache_key(
     math_fidelity: Optional[str],
     target_arch: Optional[str],
     compiler_options: CompilerOptions = CompilerOptions(),
-    l1_budget_override: int = 0,
+    l1_budget_override: Any = 0,
 ) -> tuple:
     """Create cache key from tensor properties and runtime compute config parameters."""
     grid_key = tuple(resolved_grid)
@@ -531,17 +542,6 @@ def _detect_memory_space_from_tensor(tensor, default: str) -> str:
     return default
 
 
-def _same_device(a, b) -> bool:
-    """Return True when *a* and *b* refer to the same TTNN device."""
-    if a is b:
-        return True
-    a_id = getattr(a, "id", None)
-    b_id = getattr(b, "id", None)
-    if callable(a_id) and callable(b_id):
-        return a_id() == b_id()
-    return False
-
-
 def _require_device(args):
     """Extract the device from tensor arguments, raising if none are on-device.
 
@@ -584,14 +584,23 @@ def _require_device(args):
     )
 
 
-def _resolve_l1_budget(args: tuple, compiler_options: CompilerOptions) -> int:
+def _resolve_l1_budget(
+    args: tuple,
+    compiler_options: CompilerOptions,
+    runtime_resource_cache: Optional[KernelRuntimeResourceCache] = None,
+) -> int:
     """Return the explicit or device-derived L1 compilation budget."""
     if compiler_options.l1_budget != 0:
         return compiler_options.l1_budget
     if not any(is_ttnn_tensor(arg) for arg in args):
         return 0
     try:
-        return get_min_remaining_l1_for_device(_require_device(args))
+        device = _require_device(args)
+        if runtime_resource_cache is not None:
+            return get_min_remaining_l1_excluding_cached_resources(
+                runtime_resource_cache, device
+            )
+        return get_min_remaining_l1_for_device(device)
     except ValueError:
         return 0
 
@@ -739,6 +748,7 @@ class CompiledTTNNKernel:
         num_pipe_sync_semaphores=0,
         pipe_sram_scratch_bytes=0,
         num_pipe_global_semaphores=0,
+        num_dfb_resets=0,
         opaque_include_paths=None,
         kernel_pipe_computed_address_dfb_indices=None,
         kernel_logical_selectors=None,
@@ -746,6 +756,7 @@ class CompiledTTNNKernel:
         runtime_resource_factory: Optional[
             Callable[..., ProgramRuntimeResources]
         ] = None,
+        runtime_resource_cache=None,
     ):
         """
         Initialize with pre-compiled kernel artifacts.
@@ -773,11 +784,13 @@ class CompiledTTNNKernel:
                 PipeNet metadata.
             num_pipe_global_semaphores: Number of GlobalSemaphore-backed
                 PipeNet counters used by this kernel.
+            num_dfb_resets: Number of synchronized DFB reset boundaries.
             kernel_pipe_computed_address_dfb_indices: Per-kernel receiver DFB indices whose
                 L1 bases are supplied as common runtime args.
             kernel_logical_selectors: Logical selector for each compiled kernel.
             operation_name: User-facing operation name for runtime diagnostics.
             runtime_resource_factory: Optional per-invocation resource callback.
+            runtime_resource_cache: Operation-owned persistent L1 resources.
         """
         self.kernel_paths = kernel_paths
         self.kernel_configs = kernel_configs
@@ -793,6 +806,7 @@ class CompiledTTNNKernel:
         self.thread_to_kernel = thread_to_kernel or {}
         self.kernel_line_offsets = kernel_line_offsets or {}
         self.num_pipe_sync_semaphores = num_pipe_sync_semaphores
+        self.num_dfb_resets = num_dfb_resets
         self.pipe_sram_scratch_bytes = pipe_sram_scratch_bytes
         self.num_pipe_global_semaphores = num_pipe_global_semaphores
         self.kernel_pipe_computed_address_dfb_indices = (
@@ -822,10 +836,18 @@ class CompiledTTNNKernel:
                     "requires logical-kernel selectors for compiled kernel indices "
                     f"{missing_selector_indices}"
                 )
-        self._pipe_global_semaphore_lifetime = []
         self.operation_name = operation_name
         self.runtime_resource_factory = runtime_resource_factory
-        self._runtime_resource_lifetimes = ()
+        owns_runtime_resource_cache = runtime_resource_cache is None
+        self._runtime_resource_cache = (
+            KernelRuntimeResourceCache()
+            if owns_runtime_resource_cache
+            else runtime_resource_cache
+        )
+        if owns_runtime_resource_cache:
+            self._runtime_resource_finalizer = attach_runtime_resource_finalizer(
+                self, self._runtime_resource_cache
+            )
         self.opaque_include_paths = opaque_include_paths or []
 
     def __call__(self, *args):
@@ -871,20 +893,14 @@ class CompiledTTNNKernel:
             core_ranges=self.core_ranges,
             program_hash=self.program_hash,
             num_pipe_sync_semaphores=self.num_pipe_sync_semaphores,
+            num_dfb_resets=self.num_dfb_resets,
             pipe_sram_scratch_bytes=self.pipe_sram_scratch_bytes,
             num_pipe_global_semaphores=self.num_pipe_global_semaphores,
-            pipe_global_semaphore_lifetime=self._pipe_global_semaphore_lifetime,
             runtime_resource_factory=self.runtime_resource_factory,
             operation_name=self.operation_name,
-            runtime_resource_lifetime_commit=(
-                self._commit_runtime_resource_lifetimes
-                if self.runtime_resource_factory is not None
-                else None
-            ),
+            runtime_resource_cache=self._runtime_resource_cache,
+            device=device,
         )
-
-    def _commit_runtime_resource_lifetimes(self, lifetimes: tuple[object, ...]) -> None:
-        self._runtime_resource_lifetimes = lifetimes
 
 
 def _write_kernel_to_tmp(name: str, source: str) -> str:
@@ -1130,10 +1146,12 @@ def _compile_ttnn_kernel(
     num_pipe_sync_semaphores: int = 0,
     pipe_sram_scratch_bytes: int = 0,
     num_pipe_global_semaphores: int = 0,
+    num_dfb_resets: int = 0,
     opaque_include_paths: Optional[List[str]] = None,
     target_arch: Optional[str] = None,
     operation_name: str = "<anonymous>",
     runtime_resource_factory: Optional[Callable[..., ProgramRuntimeResources]] = None,
+    runtime_resource_cache: Optional[KernelRuntimeResourceCache] = None,
 ):
     """
     Compile kernel to CompiledTTNNKernel for execution via ttnn.generic_op.
@@ -1393,6 +1411,7 @@ def _compile_ttnn_kernel(
         thread_to_kernel=thread_to_kernel,
         kernel_line_offsets=kernel_line_offsets,
         num_pipe_sync_semaphores=num_pipe_sync_semaphores,
+        num_dfb_resets=num_dfb_resets,
         pipe_sram_scratch_bytes=pipe_sram_scratch_bytes,
         num_pipe_global_semaphores=num_pipe_global_semaphores,
         opaque_include_paths=opaque_include_paths or [],
@@ -1400,6 +1419,7 @@ def _compile_ttnn_kernel(
         kernel_logical_selectors=kernel_logical_selectors,
         operation_name=operation_name,
         runtime_resource_factory=runtime_resource_factory,
+        runtime_resource_cache=runtime_resource_cache,
     )
 
     if verbose:
@@ -1441,6 +1461,7 @@ def _compile_ttnn_kernel(
             program_hash=program_hash,
             kernel_name=operation_name,
             num_pipe_sync_semaphores=num_pipe_sync_semaphores,
+            num_dfb_resets=num_dfb_resets,
             pipe_sram_scratch_bytes=pipe_sram_scratch_bytes,
             num_pipe_global_semaphores=num_pipe_global_semaphores,
             requires_runtime_resource_factory=runtime_resource_factory is not None,
@@ -1509,6 +1530,7 @@ def _build_pipenet_graph(nets):
 def _collect_captures(
     f: Callable,
     bound_dispatch_conditions: Optional[Mapping[str, _BoundDispatchCondition]] = None,
+    bound_dfb_resets: Optional[Mapping[str, _BoundDFBReset]] = None,
 ) -> Dict[str, Any]:
     """
     Collect and convert captured variables from function closure.
@@ -1551,6 +1573,13 @@ def _collect_captures(
             if bound_condition is not None and bound_condition.declaration is val:
                 return bound_condition
             return _bind_current_dispatch_condition(val)
+        elif isinstance(val, DFBReset):
+            bound_reset = (
+                bound_dfb_resets.get(name) if bound_dfb_resets is not None else None
+            )
+            if bound_reset is not None and bound_reset.declaration is val:
+                return bound_reset
+            return _bind_current_dfb_reset(val)
         else:
             raise TypeError(f"Unhandled capture for vars of type({type(val)})")
 
@@ -1779,6 +1808,14 @@ def _extract_pipe_sync_semaphore_count(module) -> Optional[int]:
     return int(attr)
 
 
+def _extract_dfb_reset_count(module) -> int:
+    """Read the number of synchronized DFB reset boundaries."""
+    attr = module.operation.attributes.get(_ttl_ir.DFB_RESET_COUNT_ATTR, None)
+    if attr is None:
+        return 0
+    return int(attr)
+
+
 def _extract_pipe_sram_scratch_bytes(module) -> int:
     """Read the per-core SRAM scratch bytes selected by pipe lowering."""
     attr = module.operation.attributes.get(_ttl_ir.PIPE_SRAM_SCRATCH_BYTES_ATTR, None)
@@ -1899,6 +1936,11 @@ def _compile(
             for name, cell in zip(f.__code__.co_freevars, f.__closure__ or ())
             if isinstance(cell.cell_contents, DispatchCondition)
         }
+        bound_dfb_resets = {
+            name: _bind_current_dfb_reset(cell.cell_contents)
+            for name, cell in zip(f.__code__.co_freevars, f.__closure__ or ())
+            if isinstance(cell.cell_contents, DFBReset)
+        }
 
         @functools.wraps(f)
         def _wrapper(*args, **kwargs):
@@ -1919,7 +1961,7 @@ def _compile(
             return _run_thread_compiler(
                 f.__name__,
                 kernel_type,
-                _collect_captures(f, bound_dispatch_conditions),
+                _collect_captures(f, bound_dispatch_conditions, bound_dfb_resets),
                 f.__globals__,
                 args,
                 kwargs,
@@ -2033,6 +2075,7 @@ def _compile_kernel(
     compiler_options: CompilerOptions = CompilerOptions(),
     l1_budget_override: int = 0,
     runtime_resource_factory: Optional[Callable[..., ProgramRuntimeResources]] = None,
+    runtime_resource_cache: Optional[KernelRuntimeResourceCache] = None,
 ) -> Optional[CompiledTTNNKernel]:
     """
     Compile kernel function to MLIR and return CompiledTTNNKernel.
@@ -2054,6 +2097,7 @@ def _compile_kernel(
         target_arch: Optional TT device architecture for target-specific lowering
         compiler_options: Compiler pipeline options
         l1_budget_override: Explicit or device-derived L1 allocation budget
+        runtime_resource_cache: Persistent resources shared by operation variants
 
     Returns:
         CompiledTTNNKernel ready for execution
@@ -2115,7 +2159,7 @@ def _compile_kernel(
             call_kwargs[param.name] = value
         else:
             call_args.append(value)
-    with _dispatch_condition_binding_scope():
+    with _dispatch_condition_binding_scope(), _dfb_reset_binding_scope():
         f(*call_args, **call_kwargs)
     threads = _get_registered_threads()
 
@@ -2163,6 +2207,7 @@ def _compile_kernel(
         logical_kernels=[thread._logical_kernel for thread in threads],
         operation_name=f.__name__,
         runtime_resource_factory=runtime_resource_factory,
+        runtime_resource_cache=runtime_resource_cache,
     )
 
 
@@ -2185,6 +2230,7 @@ def _lower_program_to_kernel(
     logical_kernels=None,
     operation_name="<anonymous>",
     runtime_resource_factory: Optional[Callable[..., ProgramRuntimeResources]] = None,
+    runtime_resource_cache: Optional[KernelRuntimeResourceCache] = None,
 ):
     """Lower compiled threads to a CompiledTTNNKernel.
 
@@ -2389,6 +2435,7 @@ def _lower_program_to_kernel(
             "ttl-finalize-dfb-indices{"
             f"reuse-user-dfbs={reuse_user_dfbs_flag} "
             f"exact-coloring-search-limit={exact_coloring_search_limit}"
+            f" l1-budget-override={l1_budget_override}"
             "}",
             set_compute_config_pass,
             f"func.func({assign_dst_pass})",
@@ -2449,7 +2496,8 @@ def _lower_program_to_kernel(
                 f"convert-ttl-to-ttkernel{{reduce-full-fp32={reduce_fp32_flag} "
                 f"pipe-computed-addresses={pipe_computed_flag} "
                 f"pipe-capacity-sync={pipe_capacity_sync_flag} "
-                f"pipe-global-semaphores-only={pipe_global_semaphores_only_flag}}}"
+                f"pipe-global-semaphores-only={pipe_global_semaphores_only_flag} "
+                f"l1-budget-override={l1_budget_override}}}"
             ),
             "func.func(ttkernel-lower-scalar-fp-types)",
             "ttkernel-insert-inits",
@@ -2544,6 +2592,7 @@ def _lower_program_to_kernel(
                 "compiled module is missing "
                 f"{_ttl_ir.PIPE_SYNC_SEMAPHORE_COUNT_ATTR}"
             )
+        dfb_reset_count = _extract_dfb_reset_count(module)
         pipe_sram_scratch_bytes = _extract_pipe_sram_scratch_bytes(module)
         pipe_global_semaphore_count = _extract_pipe_global_semaphore_count(module)
 
@@ -2565,12 +2614,14 @@ def _lower_program_to_kernel(
             all_source_lines=all_source_lines,
             kernel_line_offsets=kernel_line_offsets,
             num_pipe_sync_semaphores=pipe_sync_semaphore_count,
+            num_dfb_resets=dfb_reset_count,
             pipe_sram_scratch_bytes=pipe_sram_scratch_bytes,
             num_pipe_global_semaphores=pipe_global_semaphore_count,
             opaque_include_paths=opaque_include_paths,
             target_arch=target_arch,
             operation_name=operation_name,
             runtime_resource_factory=runtime_resource_factory,
+            runtime_resource_cache=runtime_resource_cache,
         )
         return compiled_kernel
 
@@ -2616,6 +2667,8 @@ def _make_operation_wrapper(
     """Build the shared top-level operation cache and execution wrapper."""
     kernel_id = random.getrandbits(64)
     cache: Dict[tuple, CompiledTTNNKernel] = {}
+    cache_lock = threading.RLock()
+    runtime_resource_cache = KernelRuntimeResourceCache()
 
     @functools.wraps(function)
     def _wrapper(*args, **kwargs):
@@ -2635,32 +2688,34 @@ def _make_operation_wrapper(
             CompilerOptions.from_argv()
         )
         target_arch = _device_target_arch(runtime_args)
-        l1_budget_override = _resolve_l1_budget(runtime_args, compiler_options)
-
-        cache_key = _make_cache_key(
-            runtime_args,
-            resolved_grid=resolved_grid,
-            fp32_dest_acc_en=fp32_dest_acc_en,
-            dst_full_sync_en=dst_full_sync_en,
-            math_fidelity=math_fidelity,
-            target_arch=target_arch,
-            compiler_options=compiler_options,
-            l1_budget_override=l1_budget_override,
-        )
-
-        compiled_kernel = cache.get(cache_key)
-        if compiled_kernel is None:
-            compiled_kernel = compile_callback(
-                runtime_args,
-                kwargs,
-                resolved_grid,
-                hash((kernel_id, cache_key)),
-                target_arch,
-                compiler_options,
-                l1_budget_override,
+        with cache_lock:
+            l1_budget_override = _resolve_l1_budget(
+                runtime_args, compiler_options, runtime_resource_cache
             )
-            if compiled_kernel is not None:
-                cache[cache_key] = compiled_kernel
+            cache_key = _make_cache_key(
+                runtime_args,
+                resolved_grid=resolved_grid,
+                fp32_dest_acc_en=fp32_dest_acc_en,
+                dst_full_sync_en=dst_full_sync_en,
+                math_fidelity=math_fidelity,
+                target_arch=target_arch,
+                compiler_options=compiler_options,
+                l1_budget_override=l1_budget_override,
+            )
+            compiled_kernel = cache.get(cache_key)
+            if compiled_kernel is None:
+                compiled_kernel = compile_callback(
+                    runtime_args,
+                    kwargs,
+                    resolved_grid,
+                    hash((kernel_id, cache_key)),
+                    target_arch,
+                    compiler_options,
+                    l1_budget_override,
+                    runtime_resource_cache,
+                )
+                if compiled_kernel is not None:
+                    cache[cache_key] = compiled_kernel
 
         if compiled_kernel is None or not _should_execute():
             return None
@@ -2698,6 +2753,7 @@ def _make_operation_wrapper(
 
         return result
 
+    attach_runtime_resource_finalizer(_wrapper, runtime_resource_cache)
     return _wrapper
 
 
@@ -2790,6 +2846,7 @@ def pykernel_gen(
             target_arch,
             compiler_options,
             l1_budget_override,
+            runtime_resource_cache,
         ):
             compile_kwargs = runtime_kwargs
             if _prepare_call is not None:
@@ -2812,6 +2869,7 @@ def pykernel_gen(
                 compiler_options=compiler_options,
                 l1_budget_override=l1_budget_override,
                 runtime_resource_factory=runtime_resource_factory,
+                runtime_resource_cache=runtime_resource_cache,
             )
 
         return _make_operation_wrapper(

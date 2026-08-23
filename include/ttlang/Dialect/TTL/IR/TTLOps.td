@@ -1972,6 +1972,50 @@ def TTL_RawAddrOp : TTL_Op<"raw_addr", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Synchronized dataflow buffer reset
+//===----------------------------------------------------------------------===//
+
+def TTL_ResetDFBsOp : TTL_Op<"reset_dfbs", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Synchronize DFB owners and reset selected interfaces";
+  let description = [{
+    `ttl.reset_dfbs` is one worker-local synchronization boundary shared by
+    the three logical kernels named by `reset`. Each participant executes the
+    same zero-or-one dynamic instance per dispatch and launch node. Before any
+    participant returns, the operation completes prior DFB-interface work and
+    restores the listed DFBs to canonical empty protocol state without
+    changing descriptor configuration or payload storage.
+
+    The operation resets read and write pointers, the packer write-tile
+    pointer, initialization state, and stream occupancy counters. It does not
+    clear payload bytes or change the descriptor. Each participating data
+    movement RISC drains its own outstanding NoC commands before publishing
+    boundary arrival. The operation cannot complete commands issued by another
+    core or a non-participating RISC, so every producer must issue its required
+    transfers before its local boundary occurrence. Runtime lowering is
+    supported only for Blackhole.
+  }];
+  let arguments = (ins
+    TTL_SynchronizedDFBResetAttr:$reset,
+    Variadic<TTL_CircularBuffer>:$dfbs
+  );
+  let assemblyFormat = "$reset `(` $dfbs `:` type($dfbs) `)` attr-dict";
+  let hasVerifier = 1;
+}
+
+def TTL_ResetAllDFBsOp
+    : TTL_Op<"reset_all_dfbs", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Synchronize DFB owners and reset every local interface";
+  let description = [{
+    `ttl.reset_all_dfbs` has the synchronization and state-reset semantics of
+    `ttl.reset_dfbs`, applied to every worker-local DFB allocated by the
+    program. It does not take DFB operands because the complete allocation set
+    is resolved after physical DFB indices are finalized.
+  }];
+  let arguments = (ins TTL_SynchronizedDFBResetAttr:$reset);
+  let assemblyFormat = "$reset attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
 // External function call (opaque)
 //===----------------------------------------------------------------------===//
 

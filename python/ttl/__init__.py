@@ -36,6 +36,7 @@ else:
         KernelRuntimeResources,
         ProgramRuntimeResources,
         DispatchCondition,
+        DFBReset,
         ScalarType,
         compute,
         datamovement,
@@ -51,6 +52,8 @@ else:
         dfb_descriptor,
         get_dfb_id,
         raw_addr,
+        reset_all_dfbs,
+        reset_dfbs,
     )
 
     from ttl._generated_elementwise import *  # noqa: F401,F403
@@ -78,6 +81,7 @@ else:
         "KernelRuntimeResources",
         "ProgramRuntimeResources",
         "DispatchCondition",
+        "DFBReset",
         "ScalarType",
         "compute",
         "datamovement",
@@ -101,5 +105,7 @@ else:
         "dfb_descriptor",
         "get_dfb_id",
         "raw_addr",
+        "reset_dfbs",
+        "reset_all_dfbs",
         *_elementwise_all,
     ]
