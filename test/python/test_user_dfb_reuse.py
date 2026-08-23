@@ -337,6 +337,55 @@ def _make_repeated_transaction_kernel(data_format):
     return repeated_transaction_kernel
 
 
+def _make_conditional_lifecycle_kernel(data_format, predicate_value):
+    @ttl.operation(grid=(1, 1))
+    def conditional_lifecycle_kernel(input_tensor, output_tensor):
+        input_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+        first_scratch_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+        second_scratch_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+        final_scratch_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+        output_dfb = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            runtime_predicate = ttl.call_extern_func(
+                SCALAR_RESULT_HEADER,
+                "scalar_predicate",
+                template_args=[predicate_value],
+                result_type=ttl.ScalarType.I32,
+            )
+            with input_dfb.wait() as input_block:
+                if runtime_predicate:
+                    with first_scratch_dfb.reserve() as first_scratch_block:
+                        first_scratch_block.store(input_block)
+                    with first_scratch_dfb.wait():
+                        pass
+
+                if runtime_predicate:
+                    with second_scratch_dfb.reserve() as second_scratch_block:
+                        second_scratch_block.store(input_block)
+                    with second_scratch_dfb.wait():
+                        pass
+
+                with final_scratch_dfb.reserve() as final_scratch_block:
+                    final_scratch_block.store(input_block)
+                with final_scratch_dfb.wait() as final_scratch_block:
+                    with output_dfb.reserve() as output_block:
+                        output_block.store(final_scratch_block)
+
+        @ttl.datamovement()
+        def read():
+            with input_dfb.reserve() as input_block:
+                ttl.copy(input_tensor[0, 0], input_block).wait()
+
+        @ttl.datamovement()
+        def write():
+            with output_dfb.wait() as output_block:
+                ttl.copy(output_block, output_tensor[0, 0]).wait()
+
+    return conditional_lifecycle_kernel
+
+
 _repeated_bf16_atom_kernel = _make_repeated_dfb_atom_kernel("bf16")
 _repeated_f32_atom_kernel = _make_repeated_dfb_atom_kernel("float32")
 _in_place_bf16_atom_kernel = _make_in_place_atom_kernel("bf16")
@@ -345,6 +394,19 @@ _capacity_test_bf16_atom_kernel = _make_capacity_test_atom_kernel("bf16")
 _capacity_test_f32_atom_kernel = _make_capacity_test_atom_kernel("float32")
 _exact_bf16_execution_domain_kernel = _make_exact_execution_domain_kernel("bf16")
 _exact_f32_execution_domain_kernel = _make_exact_execution_domain_kernel("float32")
+_conditional_bf16_true_lifecycle_kernel = _make_conditional_lifecycle_kernel(
+    "bf16", True
+)
+_conditional_bf16_false_lifecycle_kernel = _make_conditional_lifecycle_kernel(
+    "bf16", False
+)
+_conditional_f32_true_lifecycle_kernel = _make_conditional_lifecycle_kernel(
+    "float32", True
+)
+_conditional_f32_false_lifecycle_kernel = _make_conditional_lifecycle_kernel(
+    "float32", False
+)
+
 assert CAPACITY_TEST_LOGICAL_DFBS == 33
 
 
@@ -598,6 +660,46 @@ def test_repeated_transaction_lifecycles_reuse_dfb(
 
     # The two source DFBs have identical pointer owners and non-overlapping
     # lifetimes. Completion and output retain distinct DFB types or owners.
+    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
+    assert physical_dfb_count == 3
+
+    actual = ttnn.to_torch(output_tensor).float()
+    expected = input_host.float()
+    if dtype == torch.bfloat16:
+        assert_allclose(actual, expected, rtol=0.05, atol=1.0)
+    else:
+        assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("operation", "dtype"),
+    [
+        (_conditional_bf16_true_lifecycle_kernel, torch.bfloat16),
+        (_conditional_bf16_false_lifecycle_kernel, torch.bfloat16),
+        (_conditional_f32_true_lifecycle_kernel, torch.float32),
+        (_conditional_f32_false_lifecycle_kernel, torch.float32),
+    ],
+    ids=["bf16-true", "bf16-false", "f32-true", "f32-false"],
+)
+@pytest.mark.parametrize(
+    ("memory_config", "to_device"),
+    [("dram", to_dram), ("l1", to_l1)],
+    ids=["dram", "l1"],
+)
+def test_same_runtime_condition_reuses_sequential_dfbs(
+    device, operation, dtype, memory_config, to_device, monkeypatch, tmp_path
+):
+    element_indices = torch.arange(TILE * TILE, dtype=torch.float32).reshape(TILE, TILE)
+    input_host = ((element_indices.remainder(257) - 128) / 64).to(dtype)
+    input_tensor = to_device(input_host, device)
+    output_tensor = to_device(torch.zeros_like(input_host), device)
+
+    final_mlir_path = tmp_path / "conditional_lifecycle.mlir"
+    monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
+    operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
+
+    # Input and output ownership prevent them from sharing with compute DFBs.
+    # Three allocations prove that all three scratch lifecycles share one index.
     physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
     assert physical_dfb_count == 3
 
