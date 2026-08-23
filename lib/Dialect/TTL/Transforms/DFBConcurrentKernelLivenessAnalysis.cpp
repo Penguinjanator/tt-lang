@@ -26,6 +26,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Debug.h"
@@ -80,6 +81,7 @@ public:
   void computeReachability() {
     unsigned eventCount = successors.size();
     reachable.assign(eventCount, llvm::BitVector(eventCount));
+    cyclicEvents = llvm::BitVector(eventCount);
     for (unsigned source = 0; source < eventCount; ++source) {
       SmallVector<unsigned> pending = {source};
       while (!pending.empty()) {
@@ -89,6 +91,14 @@ public:
         }
         reachable[source].set(event);
         pending.append(successors[event].begin(), successors[event].end());
+      }
+    }
+    for (unsigned source = 0; source < eventCount; ++source) {
+      for (unsigned destination : successors[source]) {
+        if (source != destination && reachable[destination].test(source)) {
+          cyclicEvents.set(source);
+          cyclicEvents.set(destination);
+        }
       }
     }
   }
@@ -101,9 +111,21 @@ public:
            !reachable[destination].test(source);
   }
 
+  /// Returns true when two distinct events belong to one reachability cycle.
+  bool mutuallyReachable(unsigned lhs, unsigned rhs) const {
+    assert(lhs < reachable.size() && rhs < reachable.size());
+    return lhs != rhs && reachable[lhs].test(rhs) && reachable[rhs].test(lhs);
+  }
+
+  bool eventParticipatesInCycle(unsigned event) const {
+    assert(event < cyclicEvents.size());
+    return cyclicEvents.test(event);
+  }
+
 private:
   SmallVector<SmallVector<unsigned>> successors;
   SmallVector<llvm::BitVector> reachable;
+  llvm::BitVector cyclicEvents;
 };
 
 // Associates a storage access with its computed launch domain and the operation
@@ -424,6 +446,59 @@ getAccessEventSpan(const DFBAccessOccurrence &access,
                          : std::nullopt;
 }
 
+// Retains cycles that cross logical DFB access events. Strict ordering
+// deliberately excludes mutual reachability, but unsafe allocation-group
+// policy must distinguish a missing relation from contradictory evidence.
+static SmallVector<llvm::BitVector> collectInconsistentAccessOrder(
+    ArrayRef<DFBLogicalLifecycle> logicalDFBs, LaunchNodeCoord node,
+    const HappensBeforeGraph &graph,
+    const DenseMap<Operation *, EventPair> &operationEvents,
+    const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
+    const AccessExecutionCounts &executionCounts, bool includeUnknownDomains) {
+  SmallVector<SmallVector<unsigned>> cyclicEventsByLogical(logicalDFBs.size());
+  for (auto [logicalIndex, logicalDFB] : llvm::enumerate(logicalDFBs)) {
+    for (const DFBAccessOccurrence &access : logicalDFB.accesses) {
+      if (!mayAccessLaunchNode(access, node, executionCounts,
+                               includeUnknownDomains)) {
+        continue;
+      }
+      std::optional<AccessEventSpan> span =
+          getAccessEventSpan(access, operationEvents, accessEvents);
+      if (!span) {
+        continue;
+      }
+      unsigned candidates[] = {span->first.entry, span->first.completion,
+                               span->last.entry, span->last.completion};
+      for (unsigned event : candidates) {
+        if (graph.eventParticipatesInCycle(event) &&
+            !llvm::is_contained(cyclicEventsByLogical[logicalIndex], event)) {
+          cyclicEventsByLogical[logicalIndex].push_back(event);
+        }
+      }
+    }
+  }
+
+  SmallVector<llvm::BitVector> inconsistent(
+      logicalDFBs.size(), llvm::BitVector(logicalDFBs.size()));
+  for (unsigned lhsIndex = 0; lhsIndex < logicalDFBs.size(); ++lhsIndex) {
+    for (unsigned rhsIndex = lhsIndex; rhsIndex < logicalDFBs.size();
+         ++rhsIndex) {
+      bool mutuallyReachable =
+          llvm::any_of(cyclicEventsByLogical[lhsIndex], [&](unsigned lhsEvent) {
+            return llvm::any_of(
+                cyclicEventsByLogical[rhsIndex], [&](unsigned rhsEvent) {
+                  return graph.mutuallyReachable(lhsEvent, rhsEvent);
+                });
+          });
+      if (mutuallyReachable) {
+        inconsistent[lhsIndex].set(rhsIndex);
+        inconsistent[rhsIndex].set(lhsIndex);
+      }
+    }
+  }
+  return inconsistent;
+}
+
 // Proves ordering between corresponding executions, not all-before-all
 // ordering across the complete runs.
 static bool runPrecedesWithinEachIteration(const AccessRun &before,
@@ -578,6 +653,55 @@ verifyPhysicalIndexUses(GetDfbIdOp getId,
   return success();
 }
 
+static LogicalResult expandSelectedResetAllocationGroups(
+    ArrayRef<DFBLogicalLifecycle> logicalDFBs,
+    MutableArrayRef<SynchronizedResetOccurrence> resetOccurrences,
+    DFBAnalysisFailure &analysisFailure) {
+  DenseMap<int64_t, SmallVector<unsigned>> membersByAllocationGroup;
+  for (auto [logicalIndex, logicalDFB] : llvm::enumerate(logicalDFBs)) {
+    if (logicalDFB.allocationGroup) {
+      membersByAllocationGroup[logicalDFB.allocationGroup.getOrdinal()]
+          .push_back(logicalIndex);
+    }
+  }
+
+  for (SynchronizedResetOccurrence &reset : resetOccurrences) {
+    if (reset.allDFBs) {
+      continue;
+    }
+    SmallVector<unsigned> expandedTargets = reset.targetLogicalIndices;
+    for (unsigned logicalIndex : reset.targetLogicalIndices) {
+      DFBAllocationGroupAttr allocationGroup =
+          logicalDFBs[logicalIndex].allocationGroup;
+      if (!allocationGroup) {
+        continue;
+      }
+      auto groupIt =
+          membersByAllocationGroup.find(allocationGroup.getOrdinal());
+      assert(groupIt != membersByAllocationGroup.end() &&
+             "allocation group must contain its reset target");
+      for (unsigned member : groupIt->second) {
+        if (logicalDFBs[member].tensorBacking) {
+          std::string message;
+          llvm::raw_string_ostream messageStream(message);
+          messageStream
+              << "selected synchronized DFB reset targeting allocation group "
+              << allocationGroup
+              << " requires scratch-backed members; logical DFB "
+              << logicalDFBs[member].logicalId << " is tensor-backed";
+          analysisFailure.set(reset.operation, messageStream.str());
+          return failure();
+        }
+      }
+      llvm::append_range(expandedTargets, groupIt->second);
+    }
+    llvm::sort(expandedTargets);
+    expandedTargets.erase(llvm::unique(expandedTargets), expandedTargets.end());
+    reset.targetLogicalIndices = std::move(expandedTargets);
+  }
+  return success();
+}
+
 // Collects logical DFB declarations and storage accesses in one module walk.
 // Stale copied indices, malformed identities, and untracked physical-index
 // escapes are rejected before launch-domain or lifetime analysis begins.
@@ -600,6 +724,7 @@ static LogicalResult collectLogicalDFBs(
       logicalDFB.logicalId = logicalId;
       logicalDFB.type = declaration.getResult().getType();
       logicalDFB.tensorBacking = declaration.getTensorBackingAttr();
+      logicalDFB.allocationGroup = assignment.allocationGroup;
       logicalDFB.compilerCreated =
           declaration->hasAttr(kCompilerAllocatedAttrName);
       logicalDFBs.push_back(std::move(logicalDFB));
@@ -778,6 +903,11 @@ static LogicalResult collectLogicalDFBs(
     return WalkResult::advance();
   });
   if (collectionResult.wasInterrupted()) {
+    return failure();
+  }
+
+  if (failed(expandSelectedResetAllocationGroups(logicalDFBs, resetOccurrences,
+                                                 analysisFailure))) {
     return failure();
   }
 
@@ -1327,6 +1457,80 @@ proveEquivalentConditionalRuns(const AccessRun &lhs, const AccessRun &rhs,
              domainState);
 }
 
+using AccessRunMatchCallback = llvm::function_ref<LogicalResult(
+    const AccessRun &, std::uint64_t, const AccessRun &, std::uint64_t,
+    std::uint64_t)>;
+using AccessRunPairCompatibility =
+    llvm::function_ref<bool(const AccessRun &, const AccessRun &)>;
+
+struct AccessRunMatchResult {
+  std::size_t sourceIndex = 0;
+  std::size_t targetIndex = 0;
+  std::uint64_t sourceOffset = 0;
+  std::uint64_t targetOffset = 0;
+
+  bool fullyMatched(ArrayRef<const AccessRun *> sources,
+                    ArrayRef<const AccessRun *> targets) const {
+    return sourceIndex == sources.size() && targetIndex == targets.size();
+  }
+};
+
+static bool accessRunsCanMatch(const AccessRun &source, const AccessRun &target,
+                               LaunchNodeCoord node,
+                               const LaunchNodeDomainState &domainState,
+                               AccessRunPairCompatibility runsAreCompatible) {
+  return source.access->numTiles == target.access->numTiles &&
+         proveEquivalentConditionalRuns(source, target, node, domainState) &&
+         runsAreCompatible(source, target);
+}
+
+static AccessRunMatchResult
+matchAccessRunPrefix(ArrayRef<const AccessRun *> sources,
+                     ArrayRef<const AccessRun *> targets, LaunchNodeCoord node,
+                     const LaunchNodeDomainState &domainState,
+                     AccessRunPairCompatibility runsAreCompatible,
+                     AccessRunMatchCallback recordMatch) {
+  AccessRunMatchResult result;
+  while (result.sourceIndex < sources.size() &&
+         result.targetIndex < targets.size()) {
+    const AccessRun &source = *sources[result.sourceIndex];
+    const AccessRun &target = *targets[result.targetIndex];
+    if (!accessRunsCanMatch(source, target, node, domainState,
+                            runsAreCompatible)) {
+      break;
+    }
+    std::uint64_t matchedCount =
+        std::min(source.executionCount - result.sourceOffset,
+                 target.executionCount - result.targetOffset);
+    if (failed(recordMatch(source, result.sourceOffset, target,
+                           result.targetOffset, matchedCount))) {
+      break;
+    }
+    result.sourceOffset += matchedCount;
+    result.targetOffset += matchedCount;
+    if (result.sourceOffset == source.executionCount) {
+      ++result.sourceIndex;
+      result.sourceOffset = 0;
+    }
+    if (result.targetOffset == target.executionCount) {
+      ++result.targetIndex;
+      result.targetOffset = 0;
+    }
+  }
+  return result;
+}
+
+static bool matchAccessRuns(ArrayRef<const AccessRun *> sources,
+                            ArrayRef<const AccessRun *> targets,
+                            LaunchNodeCoord node,
+                            const LaunchNodeDomainState &domainState,
+                            AccessRunPairCompatibility runsAreCompatible,
+                            AccessRunMatchCallback recordMatch) {
+  return matchAccessRunPrefix(sources, targets, node, domainState,
+                              runsAreCompatible, recordMatch)
+      .fullyMatched(sources, targets);
+}
+
 // Adds completion edges between matched push/wait transaction instances.
 static void addMatchedPushWaitEdges(
     ArrayRef<DFBLogicalLifecycle> logicalDFBs, HappensBeforeGraph &graph,
@@ -1349,52 +1553,31 @@ static void addMatchedPushWaitEdges(
       }
     }
 
-    std::size_t pushIndex = 0;
-    std::size_t waitIndex = 0;
-    std::uint64_t pushOffset = 0;
-    std::uint64_t waitOffset = 0;
     SmallVector<std::pair<unsigned, unsigned>> synchronizationEdges;
-    bool matched = true;
-    while (pushIndex < pushes.size() && waitIndex < waits.size()) {
-      const AccessRun &push = *pushes[pushIndex];
-      const AccessRun &wait = *waits[waitIndex];
-      if (push.access->numTiles != wait.access->numTiles ||
-          !proveEquivalentConditionalRuns(push, wait, node, domainState)) {
-        matched = false;
-        break;
-      }
-      std::optional<AccessEventSpan> pushEvents =
-          getAccessEventSpan(*push.access, operationEvents, accessEvents);
-      std::optional<AccessEventSpan> waitEvents =
-          getAccessEventSpan(*wait.access, operationEvents, accessEvents);
-      if (!pushEvents || !waitEvents) {
-        matched = false;
-        break;
-      }
-
-      std::uint64_t matchedCount = std::min(push.executionCount - pushOffset,
-                                            wait.executionCount - waitOffset);
-      if (pushOffset == 0 && waitOffset == 0) {
-        synchronizationEdges.emplace_back(pushEvents->first.completion,
-                                          waitEvents->first.completion);
-      }
-      pushOffset += matchedCount;
-      waitOffset += matchedCount;
-      if (pushOffset == push.executionCount &&
-          waitOffset == wait.executionCount) {
-        synchronizationEdges.emplace_back(pushEvents->last.completion,
-                                          waitEvents->last.completion);
-      }
-      if (pushOffset == push.executionCount) {
-        ++pushIndex;
-        pushOffset = 0;
-      }
-      if (waitOffset == wait.executionCount) {
-        ++waitIndex;
-        waitOffset = 0;
-      }
-    }
-    matched &= pushIndex == pushes.size() && waitIndex == waits.size();
+    bool matched = matchAccessRuns(
+        pushes, waits, node, domainState,
+        [](const AccessRun &, const AccessRun &) { return true; },
+        [&](const AccessRun &push, std::uint64_t pushOffset,
+            const AccessRun &wait, std::uint64_t waitOffset,
+            std::uint64_t matchedCount) {
+          std::optional<AccessEventSpan> pushEvents =
+              getAccessEventSpan(*push.access, operationEvents, accessEvents);
+          std::optional<AccessEventSpan> waitEvents =
+              getAccessEventSpan(*wait.access, operationEvents, accessEvents);
+          if (!pushEvents || !waitEvents) {
+            return failure();
+          }
+          if (pushOffset == 0 && waitOffset == 0) {
+            synchronizationEdges.emplace_back(pushEvents->first.completion,
+                                              waitEvents->first.completion);
+          }
+          if (pushOffset + matchedCount == push.executionCount &&
+              waitOffset + matchedCount == wait.executionCount) {
+            synchronizationEdges.emplace_back(pushEvents->last.completion,
+                                              waitEvents->last.completion);
+          }
+          return success();
+        });
     if (!matched) {
       continue;
     }
@@ -1452,6 +1635,27 @@ static bool proveAllRunExecutionsBefore(
                                 afterEvents->first.entry);
 }
 
+static bool acquireReleaseRunsAlign(
+    const AccessRun &acquire, const AccessRun &release,
+    const HappensBeforeGraph &graph,
+    const DenseMap<Operation *, EventPair> &operationEvents,
+    const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
+        &accessEvents) {
+  bool nativeAcquirePrecedesRelease =
+      ((isa<CBReserveOp>(acquire.access->operation) &&
+        isa<CBPushOp>(release.access->operation)) ||
+       (isa<CBWaitOp>(acquire.access->operation) &&
+        isa<CBPopOp>(release.access->operation))) &&
+      acquire.access->operation->getBlock() ==
+          release.access->operation->getBlock() &&
+      acquire.access->operation->isBeforeInBlock(release.access->operation);
+  return acquire.executionCount == release.executionCount &&
+         acquire.iterationDomain == release.iterationDomain &&
+         (nativeAcquirePrecedesRelease ||
+          proveRunBeforeWithinEachIteration(acquire, release, graph,
+                                            operationEvents, accessEvents));
+}
+
 static bool proveAlignedAcquireReleaseRuns(
     ArrayRef<const AccessRun *> acquires, ArrayRef<const AccessRun *> releases,
     const HappensBeforeGraph &graph,
@@ -1465,21 +1669,9 @@ static bool proveAlignedAcquireReleaseRuns(
       llvm::all_of(llvm::zip_equal(acquires, releases), [&](auto pair) {
         const AccessRun &acquire = *std::get<0>(pair);
         const AccessRun &release = *std::get<1>(pair);
-        bool nativeAcquirePrecedesRelease =
-            ((isa<CBReserveOp>(acquire.access->operation) &&
-              isa<CBPushOp>(release.access->operation)) ||
-             (isa<CBWaitOp>(acquire.access->operation) &&
-              isa<CBPopOp>(release.access->operation))) &&
-            acquire.access->operation->getBlock() ==
-                release.access->operation->getBlock() &&
-            acquire.access->operation->isBeforeInBlock(
-                release.access->operation);
-        return acquire.executionCount == release.executionCount &&
-               acquire.iterationDomain == release.iterationDomain &&
-               acquire.access->numTiles == release.access->numTiles &&
-               (nativeAcquirePrecedesRelease ||
-                proveRunBeforeWithinEachIteration(
-                    acquire, release, graph, operationEvents, accessEvents));
+        return acquire.access->numTiles == release.access->numTiles &&
+               acquireReleaseRunsAlign(acquire, release, graph, operationEvents,
+                                       accessEvents);
       });
   if (!pairsAreAligned) {
     return false;
@@ -1520,24 +1712,26 @@ static void appendTransactionRun(DFBPerNodeLifetime &lifetime,
   lifetime.transactionRuns.push_back({executionCount, tilesPerExecution});
 }
 
-// Proves that every acquire in a finite transaction sequence names one
-// contiguous interval. A reset may canonicalize a safe nonzero final offset,
-// but it cannot repair an earlier acquire that crossed the allocation end.
-static bool
-proveNonStraddlingTransactionRuns(ArrayRef<DFBTransactionRun> transactionRuns,
-                                  std::uint64_t physicalTileCount) {
-  std::uint64_t pointerOffset = 0;
+} // namespace
+
+FailureOr<std::uint64_t>
+advanceDFBTransactionCursor(ArrayRef<DFBTransactionRun> transactionRuns,
+                            std::uint64_t physicalTileCount,
+                            std::uint64_t pointerOffset) {
+  if (physicalTileCount == 0 || pointerOffset >= physicalTileCount) {
+    return failure();
+  }
   for (const DFBTransactionRun &run : transactionRuns) {
     if (run.executionCount == 0 || run.tilesPerExecution <= 0 ||
         static_cast<std::uint64_t>(run.tilesPerExecution) > physicalTileCount) {
-      return false;
+      return failure();
     }
     std::uint64_t tilesPerExecution = run.tilesPerExecution;
     std::uint64_t remainingTiles = physicalTileCount - pointerOffset;
     std::uint64_t executionsBeforeBoundary = remainingTiles / tilesPerExecution;
     if (remainingTiles % tilesPerExecution != 0) {
       if (run.executionCount > executionsBeforeBoundary) {
-        return false;
+        return failure();
       }
       pointerOffset += run.executionCount * tilesPerExecution;
       continue;
@@ -1555,7 +1749,7 @@ proveNonStraddlingTransactionRuns(ArrayRef<DFBTransactionRun> transactionRuns,
     std::uint64_t executionsPerCycle = physicalTileCount / tilesPerExecution;
     if (physicalTileCount % tilesPerExecution != 0) {
       if (remainingExecutions > executionsPerCycle) {
-        return false;
+        return failure();
       }
       pointerOffset = remainingExecutions * tilesPerExecution;
       continue;
@@ -1563,8 +1757,10 @@ proveNonStraddlingTransactionRuns(ArrayRef<DFBTransactionRun> transactionRuns,
     pointerOffset =
         (remainingExecutions % executionsPerCycle) * tilesPerExecution;
   }
-  return true;
+  return pointerOffset;
 }
+
+namespace {
 
 // Derives exact-domain or possible-domain per-node lifetime facts. Possible
 // facts control reuse only after proving conditional boundedness.
@@ -1862,9 +2058,9 @@ static DFBQuiescenceProof computeProtocolLifetime(
     }
   }
   if (hasCanonicalResetTerminator &&
-      !proveNonStraddlingTransactionRuns(
+      failed(advanceDFBTransactionCursor(
           lifetime.transactionRuns,
-          static_cast<std::uint64_t>(physicalTileCount))) {
+          static_cast<std::uint64_t>(physicalTileCount)))) {
     return {DFBQuiescenceFailureReason::MismatchedTransaction,
             reserves.front()->access->operation};
   }
@@ -2097,6 +2293,8 @@ static DFBQuiescenceProof computePerNodeLifetime(
     epoch.writePointerOwner = epochLifetime.writePointerOwner;
     epoch.readPointerOwner = epochLifetime.readPointerOwner;
     epoch.quiescence = proof;
+    epoch.earliestEntryEvents = epochLifetime.earliestEntryEvents;
+    epoch.terminalCompletionEvents = epochLifetime.terminalCompletionEvents;
     if (resetTerminated) {
       const OrderedResetBoundary &boundary = boundaries[epochIndex];
       epoch.terminalResetOrdinal = boundary.reset->reset.getOrdinal();
@@ -2104,8 +2302,6 @@ static DFBQuiescenceProof computePerNodeLifetime(
       epochLifetime.terminalCompletionEvents = {boundary.events.completion};
       epochLifetime.terminalStateCanonical = true;
     }
-    epoch.earliestEntryEvents = epochLifetime.earliestEntryEvents;
-    epoch.terminalCompletionEvents = epochLifetime.terminalCompletionEvents;
     lifetime.resetEpochs.push_back(std::move(epoch));
 
     if (!hasActiveEpoch) {
@@ -2193,6 +2389,112 @@ static bool lifetimeIsOutsideReset(const DFBPerNodeLifetime &lifetime,
       });
 }
 
+enum class ResetSide { Before, After };
+
+using AccessResetSides = DenseMap<const DFBAccessOccurrence *, ResetSide>;
+
+static bool protocolRunsCrossReset(
+    const DFBLogicalLifecycle &logicalDFB, DFBProtocolEffectKind sourceEffect,
+    DFBProtocolEffectKind targetEffect, const AccessResetSides &accessSides,
+    const AccessRuns &accessRuns, LaunchNodeCoord node,
+    const LaunchNodeDomainState &domainState,
+    AccessRunPairCompatibility runsAreCompatible) {
+  SmallVector<const AccessRun *> sourcesBeforeReset;
+  SmallVector<const AccessRun *> targetsBeforeReset;
+  SmallVector<const AccessRun *> sourcesAfterReset;
+  SmallVector<const AccessRun *> targetsAfterReset;
+  bool hasUnmodeledSourceBeforeReset = false;
+  bool hasUnmodeledTargetAfterReset = false;
+  for (const DFBAccessOccurrence &access : logicalDFB.accesses) {
+    auto side = accessSides.find(&access);
+    if (side == accessSides.end() || !access.protocolEffect ||
+        (*access.protocolEffect != sourceEffect &&
+         *access.protocolEffect != targetEffect)) {
+      continue;
+    }
+    bool isSource = *access.protocolEffect == sourceEffect;
+    auto run = accessRuns.find(&access);
+    if (run == accessRuns.end()) {
+      hasUnmodeledSourceBeforeReset |=
+          isSource && side->second == ResetSide::Before;
+      hasUnmodeledTargetAfterReset |=
+          !isSource && side->second == ResetSide::After;
+      continue;
+    }
+    SmallVector<const AccessRun *> &sideRuns =
+        side->second == ResetSide::Before
+            ? (isSource ? sourcesBeforeReset : targetsBeforeReset)
+            : (isSource ? sourcesAfterReset : targetsAfterReset);
+    sideRuns.push_back(&run->second);
+  }
+
+  auto ignoreMatch = [](const AccessRun &, std::uint64_t, const AccessRun &,
+                        std::uint64_t, std::uint64_t) { return success(); };
+  AccessRunMatchResult beforeResetMatch =
+      matchAccessRunPrefix(sourcesBeforeReset, targetsBeforeReset, node,
+                           domainState, runsAreCompatible, ignoreMatch);
+  AccessRunMatchResult afterResetMatch =
+      matchAccessRunPrefix(sourcesAfterReset, targetsAfterReset, node,
+                           domainState, runsAreCompatible, ignoreMatch);
+
+  bool hasModeledSourceBeforeReset =
+      beforeResetMatch.sourceIndex < sourcesBeforeReset.size();
+  bool hasModeledTargetAfterReset =
+      afterResetMatch.targetIndex < targetsAfterReset.size();
+  return (hasUnmodeledSourceBeforeReset || hasModeledSourceBeforeReset) &&
+         (hasUnmodeledTargetAfterReset || hasModeledTargetAfterReset);
+}
+
+static bool unprovenLifecycleIsOutsideReset(
+    const DFBLogicalLifecycle &logicalDFB, LaunchNodeCoord node,
+    const AccessExecutionCounts &executionCounts, bool includeUnknownDomains,
+    EventPair resetEvents, const HappensBeforeGraph &graph,
+    const DenseMap<Operation *, EventPair> &operationEvents,
+    const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
+    const AccessRuns &accessRuns, const LaunchNodeDomainState &domainState) {
+  AccessResetSides accessSides;
+  for (const DFBAccessOccurrence &access : logicalDFB.accesses) {
+    if (!mayAccessLaunchNode(access, node, executionCounts,
+                             includeUnknownDomains)) {
+      continue;
+    }
+    std::optional<AccessEventSpan> events =
+        getAccessEventSpan(access, operationEvents, accessEvents);
+    if (!events) {
+      return false;
+    }
+    bool beforeReset =
+        graph.strictlyPrecedes(events->last.completion, resetEvents.entry);
+    bool afterReset =
+        graph.strictlyPrecedes(resetEvents.completion, events->first.entry);
+    if (beforeReset == afterReset) {
+      return false;
+    }
+    accessSides.try_emplace(&access,
+                            beforeReset ? ResetSide::Before : ResetSide::After);
+  }
+  return !protocolRunsCrossReset(
+             logicalDFB, DFBProtocolEffectKind::Reserve,
+             DFBProtocolEffectKind::Push, accessSides, accessRuns, node,
+             domainState,
+             [&](const AccessRun &reserve, const AccessRun &push) {
+               return acquireReleaseRunsAlign(reserve, push, graph,
+                                              operationEvents, accessEvents);
+             }) &&
+         !protocolRunsCrossReset(
+             logicalDFB, DFBProtocolEffectKind::Push,
+             DFBProtocolEffectKind::Wait, accessSides, accessRuns, node,
+             domainState,
+             [](const AccessRun &, const AccessRun &) { return true; }) &&
+         !protocolRunsCrossReset(
+             logicalDFB, DFBProtocolEffectKind::Wait,
+             DFBProtocolEffectKind::Pop, accessSides, accessRuns, node,
+             domainState, [&](const AccessRun &wait, const AccessRun &pop) {
+               return acquireReleaseRunsAlign(wait, pop, graph, operationEvents,
+                                              accessEvents);
+             });
+}
+
 static Operation *getResetOverlapEvidence(
     const DFBLogicalLifecycle &logicalDFB, const DFBPerNodeLifetime &lifetime,
     LaunchNodeCoord node, const AccessExecutionCounts &executionCounts,
@@ -2226,6 +2528,7 @@ static void collectResetAllocationConflicts(
     const AccessExecutionCounts &executionCounts,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
+    const AccessRuns &accessRuns, const LaunchNodeDomainState &domainState,
     bool usePossibleLifetimes,
     SmallVectorImpl<DFBResetAllocationConflict> &conflicts) {
   for (const ValidatedSynchronizedReset &reset : synchronizedResets) {
@@ -2238,15 +2541,33 @@ static void collectResetAllocationConflicts(
         unsigned overlappingLogicalIndex =
             static_cast<unsigned>(indexedLogicalDFB.index());
         const DFBLogicalLifecycle &logicalDFB = indexedLogicalDFB.value();
+        if (targetLogicalIndex == overlappingLogicalIndex) {
+          continue;
+        }
+        bool sharesAllocationGroup =
+            logicalDFBs[targetLogicalIndex].allocationGroup &&
+            logicalDFBs[targetLogicalIndex].allocationGroup ==
+                logicalDFB.allocationGroup;
         if (llvm::is_contained(reset.targetLogicalIndices,
-                               overlappingLogicalIndex)) {
+                               overlappingLogicalIndex) &&
+            !sharesAllocationGroup) {
           continue;
         }
         const DFBPerNodeLifetime *lifetime =
             usePossibleLifetimes ? logicalDFB.findPossibleNodeLifetime(node)
                                  : logicalDFB.findNodeLifetime(node);
-        if (!lifetime || !lifetime->mayBeActive ||
-            lifetimeIsOutsideReset(*lifetime, resetEvents->second, graph)) {
+        if (!lifetime || !lifetime->mayBeActive) {
+          continue;
+        }
+        bool outsideReset =
+            lifetime->quiescence.proven()
+                ? lifetimeIsOutsideReset(*lifetime, resetEvents->second, graph)
+                : unprovenLifecycleIsOutsideReset(
+                      logicalDFB, node, executionCounts,
+                      /*includeUnknownDomains=*/usePossibleLifetimes,
+                      resetEvents->second, graph, operationEvents, accessEvents,
+                      accessRuns, domainState);
+        if (outsideReset) {
           continue;
         }
         bool alreadyRecorded = llvm::any_of(
@@ -2437,6 +2758,8 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
                      domainState.baseDomain.nodes.end());
   orderedBeforeByNode.reserve(launchNodes.size());
   conditionallyOrderedBeforeByNode.reserve(launchNodes.size());
+  inconsistentOrderByNode.reserve(launchNodes.size());
+  conditionallyInconsistentOrderByNode.reserve(launchNodes.size());
   bool collectAllocationDiagnostics = false;
   LLVM_DEBUG(collectAllocationDiagnostics = true);
   if (collectAllocationDiagnostics) {
@@ -2489,7 +2812,7 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
 
     collectResetAllocationConflicts(
         logicalDFBs, validatedResets, resetBoundaryEvents, graph, node,
-        executionCounts, operationEvents, accessEvents,
+        executionCounts, operationEvents, accessEvents, accessRuns, domainState,
         /*usePossibleLifetimes=*/false, resetAllocationConflicts);
 
     SmallVector<llvm::BitVector> nodeOrdering(
@@ -2511,10 +2834,15 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
       }
     }
     orderedBeforeByNode.push_back(std::move(nodeOrdering));
+    inconsistentOrderByNode.push_back(collectInconsistentAccessOrder(
+        logicalDFBs, node, graph, operationEvents, accessEvents,
+        executionCounts, /*includeUnknownDomains=*/false));
 
     // Possible-domain reachability cannot affect exact-domain reuse.
     if (!hasUnknownDFBLaunchDomain) {
       conditionallyOrderedBeforeByNode.emplace_back(
+          logicalDFBs.size(), llvm::BitVector(logicalDFBs.size()));
+      conditionallyInconsistentOrderByNode.emplace_back(
           logicalDFBs.size(), llvm::BitVector(logicalDFBs.size()));
       continue;
     }
@@ -2556,8 +2884,8 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
     collectResetAllocationConflicts(
         logicalDFBs, validatedResets, possibleResetBoundaryEvents,
         possibleGraph, node, executionCounts, possibleOperationEvents,
-        possibleAccessEvents, /*usePossibleLifetimes=*/true,
-        resetAllocationConflicts);
+        possibleAccessEvents, possibleAccessRuns, domainState,
+        /*usePossibleLifetimes=*/true, resetAllocationConflicts);
 
     SmallVector<llvm::BitVector> conditionalNodeOrdering(
         logicalDFBs.size(), llvm::BitVector(logicalDFBs.size()));
@@ -2579,7 +2907,18 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
     }
     conditionallyOrderedBeforeByNode.push_back(
         std::move(conditionalNodeOrdering));
+    conditionallyInconsistentOrderByNode.push_back(
+        collectInconsistentAccessOrder(logicalDFBs, node, possibleGraph,
+                                       possibleOperationEvents,
+                                       possibleAccessEvents, executionCounts,
+                                       /*includeUnknownDomains=*/true));
   }
+
+  assert(orderedBeforeByNode.size() == launchNodes.size() &&
+         conditionallyOrderedBeforeByNode.size() == launchNodes.size() &&
+         inconsistentOrderByNode.size() == launchNodes.size() &&
+         conditionallyInconsistentOrderByNode.size() == launchNodes.size() &&
+         "per-node order relations must cover the launch grid");
 
   for (DFBLogicalLifecycle &logicalDFB : logicalDFBs) {
     logicalDFB.bounded = logicalDFB.launchDomain.known &&
@@ -2627,6 +2966,27 @@ bool DFBConcurrentKernelLivenessAnalysis::isConditionallyOrderedBefore(
          afterIndex < conditionallyOrderedBeforeByNode[nodeIndex].size());
   return conditionallyOrderedBeforeByNode[nodeIndex][beforeIndex].test(
       afterIndex);
+}
+
+bool DFBConcurrentKernelLivenessAnalysis::hasInconsistentOrder(
+    unsigned lhsIndex, unsigned rhsIndex, LaunchNodeCoord node) const {
+  auto nodeIt = llvm::find(launchNodes, node);
+  assert(nodeIt != launchNodes.end() && "node must be in the launch grid");
+  unsigned nodeIndex = nodeIt - launchNodes.begin();
+  assert(lhsIndex < inconsistentOrderByNode[nodeIndex].size() &&
+         rhsIndex < inconsistentOrderByNode[nodeIndex].size());
+  return inconsistentOrderByNode[nodeIndex][lhsIndex].test(rhsIndex);
+}
+
+bool DFBConcurrentKernelLivenessAnalysis::hasConditionallyInconsistentOrder(
+    unsigned lhsIndex, unsigned rhsIndex, LaunchNodeCoord node) const {
+  auto nodeIt = llvm::find(launchNodes, node);
+  assert(nodeIt != launchNodes.end() && "node must be in the launch grid");
+  unsigned nodeIndex = nodeIt - launchNodes.begin();
+  assert(lhsIndex < conditionallyInconsistentOrderByNode[nodeIndex].size() &&
+         rhsIndex < conditionallyInconsistentOrderByNode[nodeIndex].size());
+  return conditionallyInconsistentOrderByNode[nodeIndex][lhsIndex].test(
+      rhsIndex);
 }
 
 } // namespace mlir::tt::ttl

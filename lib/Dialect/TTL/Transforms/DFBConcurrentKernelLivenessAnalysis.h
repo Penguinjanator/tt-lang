@@ -137,6 +137,13 @@ struct DFBTransactionRun {
   }
 };
 
+/// Advances one physical ring cursor through finite transaction runs. Fails
+/// when an acquire would cross the end of the physical allocation.
+FailureOr<std::uint64_t>
+advanceDFBTransactionCursor(ArrayRef<DFBTransactionRun> transactionRuns,
+                            std::uint64_t physicalTileCount,
+                            std::uint64_t initialOffset = 0);
+
 /// Protocol state proved for one access interval between synchronized resets.
 struct DFBLifecycleEpoch {
   SmallVector<unsigned> accessOccurrenceIndices;
@@ -198,6 +205,7 @@ struct DFBLogicalLifecycle {
   int64_t logicalId = 0;
   Type type;
   TensorBackingAttr tensorBacking;
+  DFBAllocationGroupAttr allocationGroup;
   bool compilerCreated = false;
   SmallVector<BindCBOp> declarations;
   SmallVector<DFBAccessOccurrence> accesses;
@@ -249,6 +257,14 @@ public:
   bool isConditionallyOrderedBefore(unsigned beforeIndex, unsigned afterIndex,
                                     LaunchNodeCoord node) const;
 
+  /// Returns true when access events prove a reachability cycle.
+  bool hasInconsistentOrder(unsigned lhsIndex, unsigned rhsIndex,
+                            LaunchNodeCoord node) const;
+
+  /// Returns inconsistent order while treating unknown domains as possible.
+  bool hasConditionallyInconsistentOrder(unsigned lhsIndex, unsigned rhsIndex,
+                                         LaunchNodeCoord node) const;
+
 private:
   void analyze(Operation *operation,
                const DFBLogicalIdentityAnalysis &logicalIdentityAnalysis);
@@ -258,6 +274,9 @@ private:
   SmallVector<SmallVector<llvm::BitVector>> orderedBeforeByNode;
   SmallVector<SmallVector<llvm::BitVector>> conditionallyOrderedBeforeByNode;
   SmallVector<DFBResetAllocationConflict> resetAllocationConflicts;
+  SmallVector<SmallVector<llvm::BitVector>> inconsistentOrderByNode;
+  SmallVector<SmallVector<llvm::BitVector>>
+      conditionallyInconsistentOrderByNode;
   Operation *errorOperation = nullptr;
   std::string errorMessage;
 };

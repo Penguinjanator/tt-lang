@@ -102,6 +102,7 @@ from .dfb_reset import (
     _bind_current_dfb_reset,
     _dfb_reset_binding_scope,
 )
+from .dfb_allocation_group import _dfb_allocation_group_binding_scope
 from .constants import SUPPORTED_MEMORY_SPACES, validate_math_fidelity
 from .diagnostics import (
     TTLangCompileError,
@@ -2159,7 +2160,11 @@ def _compile_kernel(
             call_kwargs[param.name] = value
         else:
             call_args.append(value)
-    with _dispatch_condition_binding_scope(), _dfb_reset_binding_scope():
+    with (
+        _dispatch_condition_binding_scope(),
+        _dfb_allocation_group_binding_scope(),
+        _dfb_reset_binding_scope(),
+    ):
         f(*call_args, **call_kwargs)
     threads = _get_registered_threads()
 
@@ -2413,6 +2418,9 @@ def _lower_program_to_kernel(
             "ttl-form-pipe-transports{" + " ".join(pipe_transport_options) + "}"
         )
         reuse_user_dfbs_flag = int(compiler_options.reuse_user_dfbs)
+        unsafe_assume_allocation_groups_flag = int(
+            compiler_options.unsafe_assume_dfb_allocation_groups
+        )
         exact_coloring_search_limit = (
             compiler_options.dfb_exact_coloring_search_limit
         )
@@ -2434,6 +2442,8 @@ def _lower_program_to_kernel(
             "func.func(ttl-coalesce-dfb-acquires)",
             "ttl-finalize-dfb-indices{"
             f"reuse-user-dfbs={reuse_user_dfbs_flag} "
+            "unsafe-assume-allocation-groups="
+            f"{unsafe_assume_allocation_groups_flag} "
             f"exact-coloring-search-limit={exact_coloring_search_limit}"
             f" l1-budget-override={l1_budget_override}"
             "}",
