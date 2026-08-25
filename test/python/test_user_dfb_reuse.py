@@ -14,7 +14,7 @@ ttnn = pytest.importorskip("ttnn", exc_type=ImportError)
 
 import ttl  # noqa: E402
 from ttl import ttl_api  # noqa: E402
-from ttlang_test_utils import to_dram, to_l1  # noqa: E402
+from ttlang_test_utils import to_dram, to_l1, to_l1_sharded  # noqa: E402
 from utils.correctness import assert_allclose  # noqa: E402
 
 pytestmark = pytest.mark.requires_device
@@ -37,6 +37,13 @@ REPEATED_TRANSACTION_HEADER = os.path.join(
 DFB_RESET_TEST_HEADER = os.path.join(
     os.path.dirname(__file__), "include", "dfb_reset_test_helpers.hpp"
 )
+INSPECT_DFB_ACCESS_HEADER = os.path.join(
+    os.path.dirname(__file__), "include", "inspect_dfb_access.hpp"
+)
+
+
+def _count_final_dfb_allocations(final_mlir_path):
+    return final_mlir_path.read_text().count("dfb_index =")
 
 
 def _make_exp_via_scratch_atom(data_format, shape=(1, 1)):
@@ -1274,6 +1281,64 @@ def _make_allocation_group_kernel(data_format):
     return allocation_group_kernel
 
 
+def _make_inspect_access_kernel(data_format):
+    compute_kernel = ttl.Kernel(ttl.KernelKind.COMPUTE)
+    reader_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+    writer_kernel = ttl.Kernel(ttl.KernelKind.DATA_MOVEMENT)
+
+    @ttl.operation(grid=(1, 1))
+    def inspect_access_kernel(raw_source, output_tensor):
+        shared_allocation = ttl.make_dfb_allocation_group()
+        source_descriptor = ttl.make_dfb(
+            data_format,
+            shape=(1, 1),
+            block_count=1,
+            allocation_group=shared_allocation,
+        )
+        later_queue = ttl.make_dfb(
+            data_format,
+            shape=(1, 1),
+            block_count=2,
+            allocation_group=shared_allocation,
+        )
+        external_result = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+        output = ttl.make_dfb(data_format, shape=(1, 1), block_count=2)
+
+        @ttl.datamovement(kernel=reader_kernel)
+        def read():
+            pass
+
+        @ttl.compute(kernel=compute_kernel)
+        def compute():
+            ttl.call_extern_func(
+                INSPECT_DFB_ACCESS_HEADER,
+                "copy_raw_tile_without_consuming_source",
+                template_args=[
+                    ttl.dfb_descriptor(source_descriptor),
+                    ttl.dfb_descriptor(external_result),
+                ],
+                func_args=[ttl.raw_addr(raw_source)],
+                dfb_effects=[
+                    ttl.DFBEffect.reserve(external_result, tiles=1),
+                    ttl.DFBEffect.push(external_result, tiles=1),
+                ],
+                dfb_accesses=[ttl.DFBAccess.inspect(source_descriptor)],
+            )
+            with external_result.wait() as source:
+                with later_queue.reserve() as destination:
+                    destination.store(source)
+            with later_queue.wait() as source:
+                with output.reserve() as destination:
+                    destination.store(source)
+
+        @ttl.datamovement(kernel=writer_kernel)
+        def write():
+            with output.wait() as source:
+                ttl.copy(source, output_tensor[0, 0]).wait()
+
+    return inspect_access_kernel
+
+
 _repeated_bf16_atom_kernel = _make_repeated_dfb_atom_kernel("bf16")
 _repeated_f32_atom_kernel = _make_repeated_dfb_atom_kernel("float32")
 _composed_control_resource_kernel = _make_composed_control_resource_kernel()
@@ -1317,6 +1382,8 @@ _dispatch_condition_f32_false_lifecycle_kernel = (
 )
 _allocation_group_bf16_kernel = _make_allocation_group_kernel("bf16")
 _allocation_group_f32_kernel = _make_allocation_group_kernel("float32")
+_inspect_bf16_kernel = _make_inspect_access_kernel("bf16")
+_inspect_f32_kernel = _make_inspect_access_kernel("float32")
 
 assert CAPACITY_TEST_LOGICAL_DFBS == 33
 
@@ -1531,8 +1598,7 @@ def test_exact_disjoint_execution_domains_reuse_dfb(
     # Input and output hardware owners keep them distinct from the compute
     # scratch DFBs. The scratch DFBs share because their exact node domains are
     # disjoint, without requiring a local lifetime-order proof.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 3
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
 
     actual = ttnn.to_torch(output_tensor).float()
     expected = input_host.float()
@@ -1572,8 +1638,7 @@ def test_repeated_transaction_lifecycles_reuse_dfb(
 
     # The two source DFBs have identical pointer owners and non-overlapping
     # lifetimes. Completion and output retain distinct DFB types or owners.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 3
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
 
     actual = ttnn.to_torch(output_tensor).float()
     expected = input_host.float()
@@ -1611,8 +1676,7 @@ def test_cumulative_queue_state_lifecycles_reuse_dfb(
     monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
     operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
 
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 2
+    assert _count_final_dfb_allocations(final_mlir_path) == 2
     actual = ttnn.to_torch(output_tensor).float()
     expected = input_host.float()
     if dtype == torch.bfloat16:
@@ -1650,8 +1714,7 @@ def test_same_runtime_condition_reuses_sequential_dfbs(
 
     # Input and output ownership prevent them from sharing with compute DFBs.
     # Three allocations prove that all three scratch lifecycles share one index.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 3
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
 
     actual = ttnn.to_torch(output_tensor).float()
     expected = input_host.float()
@@ -1697,8 +1760,7 @@ def test_dispatch_condition_reuses_dfbs_across_logical_kernels(
 
     # The first and second sources have equal types and pointer owners. Their
     # separately evaluated producer and consumer conditions share one identity.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 3
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
 
     actual = ttnn.to_torch(output_tensor).float()
     expected = (
@@ -1749,8 +1811,7 @@ def test_synchronized_reset_terminates_producer_epoch(
 
     # The producer-only DFB becomes canonical at the reset and shares with the
     # following source. The compute-produced output retains a distinct index.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 2
+    assert _count_final_dfb_allocations(final_mlir_path) == 2
 
     actual = ttnn.to_torch(output_tensor).float()
     expected = input_host[:, TILE * grid_cols :].float()
@@ -1891,8 +1952,7 @@ def test_selected_reset_preserves_non_target_live_aliases(
     for _invocation_index in range(2):
         operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
 
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 2
+    assert _count_final_dfb_allocations(final_mlir_path) == 2
     assert_allclose(
         ttnn.to_torch(output_tensor).float(),
         input_host.float(),
@@ -1928,8 +1988,7 @@ def test_allocation_group_reuses_interleaved_reset_epochs(
     for _ in range(2):
         operation(input_tensor, output_tensor, options="--ttl-reuse-user-dfbs")
 
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 1
+    assert _count_final_dfb_allocations(final_mlir_path) == 1
     actual = ttnn.to_torch(output_tensor).float()
     expected = torch.cat(
         (
@@ -1938,6 +1997,43 @@ def test_allocation_group_reuses_interleaved_reset_epochs(
         ),
         dim=1,
     )
+    if dtype == torch.bfloat16:
+        assert_allclose(actual, expected, rtol=0.05, atol=1.0)
+    else:
+        assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("operation", "dtype"),
+    [
+        (_inspect_bf16_kernel, torch.bfloat16),
+        (_inspect_f32_kernel, torch.float32),
+    ],
+    ids=["bf16", "f32"],
+)
+@pytest.mark.parametrize(
+    ("memory_config", "to_device"),
+    [("dram", to_dram), ("l1", to_l1)],
+    ids=["dram", "l1"],
+)
+def test_inspect_access_reuses_allocation_group(
+    device, operation, dtype, memory_config, to_device, monkeypatch, tmp_path
+):
+    element_indices = torch.arange(TILE * TILE, dtype=torch.float32).reshape(TILE, TILE)
+    first_host = ((element_indices.remainder(257) - 128) / 64).to(dtype)
+    second_host = ((element_indices.remainder(193) - 96) / 48).to(dtype)
+    first_source = to_l1_sharded(first_host, device)
+    second_source = to_l1_sharded(second_host, device)
+    output_tensor = to_device(torch.zeros_like(first_host), device)
+
+    final_mlir_path = tmp_path / "inspect_access.mlir"
+    monkeypatch.setenv("TTLANG_FINAL_MLIR", str(final_mlir_path))
+    operation(first_source, output_tensor, options="--ttl-reuse-user-dfbs")
+    operation(second_source, output_tensor, options="--ttl-reuse-user-dfbs")
+
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
+    actual = ttnn.to_torch(output_tensor).float()
+    expected = second_host.float()
     if dtype == torch.bfloat16:
         assert_allclose(actual, expected, rtol=0.05, atol=1.0)
     else:
@@ -1973,8 +2069,7 @@ def test_nested_unknown_reset_target_does_not_reverse_reset_order(
 
     # The interleaved group uses one index. The unresolved dynamic scratch
     # remains separate rather than creating a global reverse reset relation.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 2
+    assert _count_final_dfb_allocations(final_mlir_path) == 2
     actual = ttnn.to_torch(output_tensor).float()
     expected = torch.cat(
         (
@@ -2060,8 +2155,7 @@ def test_disjoint_incompatible_static_configurations_do_not_reuse_dfb(
 
     # The two input DFBs are active on disjoint nodes, but their unpack modes
     # require distinct physical indices. The output DFB adds a third index.
-    physical_dfb_count = final_mlir_path.read_text().count("dfb_index =")
-    assert physical_dfb_count == 3
+    assert _count_final_dfb_allocations(final_mlir_path) == 3
 
     first_expected = torch.exp(first_input)
     second_expected = second_input[0:1, :].expand(TILE, TILE)
