@@ -416,6 +416,13 @@ struct AccessRun {
 
 using AccessRuns = DenseMap<const DFBAccessOccurrence *, AccessRun>;
 
+// The listed operations execute each nested region at most once per
+// invocation, so only enclosing loops can repeat an access.
+static bool executesRegionsAtMostOnce(Operation *operation) {
+  return isa<affine::AffineIfOp, scf::IfOp, scf::IndexSwitchOp,
+             scf::ExecuteRegionOp, IfSrcOp, IfDstOp>(operation);
+}
+
 static AccessDomain refineUnknownAccessDomainFromExecutionCounts(
     Operation *operation, AccessDomain accessDomain,
     const LivenessDomainState &domainState) {
@@ -438,8 +445,8 @@ static AccessDomain refineUnknownAccessDomainFromExecutionCounts(
 }
 
 // Proves that an access executes once in every iteration of one immutable
-// structured loop nest. Region selection between the loops and the access is
-// rejected because an aggregate count cannot prove per-iteration execution.
+// structured loop nest. At-most-once regions must be selected on every
+// enclosing-loop invocation.
 static std::optional<StaticIterationDomain> getUniformStaticIterationDomain(
     Operation *operation, std::uint64_t executionCount, LaunchNodeCoord node,
     const LivenessDomainState &domainState) {
@@ -469,7 +476,14 @@ static std::optional<StaticIterationDomain> getUniformStaticIterationDomain(
     if (!loop) {
       std::optional<std::uint64_t> parentExecutionCount =
           getExactExecutionCountAtLaunchNode(parent, node, domainState);
-      if (!parentExecutionCount || *parentExecutionCount != 1) {
+      // Equality proves that an at-most-once region was selected for every
+      // parent invocation, including each enclosing-loop iteration.
+      std::optional<std::uint64_t> selectedExecutionCount =
+          parentExecutionCount ? llvm::checkedMulUnsigned(*parentExecutionCount,
+                                                          domainExecutionCount)
+                               : std::nullopt;
+      if (!executesRegionsAtMostOnce(parent) || !selectedExecutionCount ||
+          *selectedExecutionCount != executionCount) {
         return std::nullopt;
       }
       nestedOperation = parent;
@@ -516,8 +530,7 @@ static bool structurallyExecutesAtMostOnce(Operation *operation) {
     Operation *parent = region ? region->getParentOp() : nullptr;
     if (!parent || !region->hasOneBlock() ||
         nestedOperation->getBlock() != &region->front() ||
-        !isa<affine::AffineIfOp, scf::IfOp, scf::IndexSwitchOp,
-             scf::ExecuteRegionOp>(parent)) {
+        !executesRegionsAtMostOnce(parent)) {
       return false;
     }
     nestedOperation = parent;
@@ -826,29 +839,48 @@ static SmallVector<llvm::BitVector> collectInconsistentAccessOrder(
   return inconsistent;
 }
 
+// A summarized call orders its effects by sequence index; accesses in
+// distinct operations use structural IR order.
+static bool
+accessOccurrencePrecedes(const DFBAccessOccurrence &before,
+                         const DFBAccessOccurrence &after,
+                         const StructuralOperationOrder &structuralOrder) {
+  if (before.operation == after.operation) {
+    return before.protocolEffect && after.protocolEffect &&
+           before.sequenceIndex < after.sequenceIndex;
+  }
+  return structuralOrder.precedes(before.operation, after.operation);
+}
+
 // Proves ordering between corresponding executions, not all-before-all
 // ordering across the complete runs.
-static bool runPrecedesWithinEachIteration(const AccessRun &before,
-                                           const AccessRun &after) {
+static bool runPrecedesWithinEachIteration(
+    const AccessRun &before, const AccessRun &after,
+    const StructuralOperationOrder &structuralOrder) {
   if (!(before.iterationDomain == after.iterationDomain) ||
       before.executionCount != after.executionCount) {
     return false;
   }
   if (before.access->operation == after.access->operation) {
-    return before.access->protocolEffect && after.access->protocolEffect &&
-           before.access->sequenceIndex < after.access->sequenceIndex;
+    return accessOccurrencePrecedes(*before.access, *after.access,
+                                    structuralOrder);
   }
-  if (before.conditionalExecution && after.conditionalExecution) {
-    return before.access->operation->getBlock() ==
-               after.access->operation->getBlock() &&
-           before.access->operation->isBeforeInBlock(after.access->operation);
-  }
-  if (before.executionCount <= 1) {
+  if (!(before.conditionalExecution && after.conditionalExecution) &&
+      before.executionCount <= 1) {
     return false;
   }
-  return before.access->operation->getBlock() ==
-             after.access->operation->getBlock() &&
-         before.access->operation->isBeforeInBlock(after.access->operation);
+  return accessOccurrencePrecedes(*before.access, *after.access,
+                                  structuralOrder);
+}
+
+// The middle edge preserves iteration-to-iteration order without one event per
+// execution.
+static void addPerIterationSpanOrder(HappensBeforeGraph &graph,
+                                     const AccessEventSpan &before,
+                                     const AccessEventSpan &after) {
+  graph.addEdge(before.first.completion, after.first.entry);
+  graph.addEdge(after.first.completion, before.last.entry);
+  graph.addEdge(before.last.completion, after.last.entry);
 }
 
 // Requires a release to follow every use owned by its acquisition; textual
@@ -1720,16 +1752,12 @@ static void buildProgramOrderTopology(
         if (afterRunIt == accessRuns.end() ||
             afterRunIt->second->executionCount <= 1 ||
             afterEventsIt == accessEvents.end() ||
-            !runPrecedesWithinEachIteration(*beforeRunIt->second,
-                                            *afterRunIt->second)) {
+            !runPrecedesWithinEachIteration(
+                *beforeRunIt->second, *afterRunIt->second, structuralOrder)) {
           continue;
         }
-        graph.addEdge(beforeEventsIt->second.first.completion,
-                      afterEventsIt->second.first.entry);
-        graph.addEdge(afterEventsIt->second.first.completion,
-                      beforeEventsIt->second.last.entry);
-        graph.addEdge(beforeEventsIt->second.last.completion,
-                      afterEventsIt->second.last.entry);
+        addPerIterationSpanOrder(graph, beforeEventsIt->second,
+                                 afterEventsIt->second);
       }
     }
   }
@@ -1755,12 +1783,7 @@ static void buildProgramOrderTopology(
         if (before == after) {
           continue;
         }
-        bool ordered =
-            before->operation == after->operation
-                ? before->protocolEffect && after->protocolEffect &&
-                      before->sequenceIndex < after->sequenceIndex
-                : structuralOrder.precedes(before->operation, after->operation);
-        if (ordered) {
+        if (accessOccurrencePrecedes(*before, *after, structuralOrder)) {
           graph.addEdge(accessEvents.at(before).last.completion,
                         accessEvents.at(after).first.entry);
         }
@@ -1966,6 +1989,7 @@ static bool matchAccessRuns(ArrayRef<const AccessRun *> sources,
 
 static FailureOr<SmallVector<const AccessRun *>> orderProtocolRuns(
     ArrayRef<const AccessRun *> runs, const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents);
 
@@ -1975,6 +1999,7 @@ static bool tryAddCumulativeQueueEdges(
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessExecutionCounts &executionCounts, const AccessRuns &accessRuns,
     LaunchNodeCoord node, const LaunchNodeDomainState &domainState,
+    const StructuralOperationOrder &structuralOrder,
     bool includeUnknownDomains);
 
 static bool
@@ -2002,6 +2027,7 @@ static void addProtocolSynchronizationEdges(
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessExecutionCounts &executionCounts, const AccessRuns &accessRuns,
     LaunchNodeCoord node, const LaunchNodeDomainState &domainState,
+    const StructuralOperationOrder &structuralOrder,
     bool includeUnknownDomains) {
   for (const DFBLogicalLifecycle &logicalDFB : logicalDFBs) {
     SmallVector<const AccessRun *> reserves;
@@ -2078,7 +2104,7 @@ static void addProtocolSynchronizationEdges(
   for (const DFBLogicalLifecycle &logicalDFB : logicalDFBs) {
     tryAddCumulativeQueueEdges(logicalDFB, graph, operationEvents, accessEvents,
                                executionCounts, accessRuns, node, domainState,
-                               includeUnknownDomains);
+                               structuralOrder, includeUnknownDomains);
   }
 }
 
@@ -2087,6 +2113,7 @@ static void addProtocolSynchronizationEdges(
 static bool proveRunBeforeWithinEachIteration(
     const AccessRun &before, const AccessRun &after,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
@@ -2094,7 +2121,7 @@ static bool proveRunBeforeWithinEachIteration(
       !(before.iterationDomain == after.iterationDomain)) {
     return false;
   }
-  if (runPrecedesWithinEachIteration(before, after)) {
+  if (runPrecedesWithinEachIteration(before, after, structuralOrder)) {
     return true;
   }
   if (before.executionCount != 1 || after.executionCount != 1) {
@@ -2114,11 +2141,12 @@ static bool proveRunBeforeWithinEachIteration(
 static bool proveAllRunExecutionsBefore(
     const AccessRun &before, const AccessRun &after,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
   if (before.executionCount == 1 && after.executionCount == 1 &&
-      runPrecedesWithinEachIteration(before, after)) {
+      runPrecedesWithinEachIteration(before, after, structuralOrder)) {
     return true;
   }
   std::optional<AccessEventSpan> beforeEvents =
@@ -2130,9 +2158,26 @@ static bool proveAllRunExecutionsBefore(
                                 afterEvents->first.entry);
 }
 
+// Run order may be pointwise within each iteration or all-before-all across
+// the complete runs.
+static bool
+proveRunPrecedes(const AccessRun &before, const AccessRun &after,
+                 const HappensBeforeGraph &graph,
+                 const StructuralOperationOrder &structuralOrder,
+                 const DenseMap<Operation *, EventPair> &operationEvents,
+                 const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
+                     &accessEvents) {
+  return proveRunBeforeWithinEachIteration(before, after, graph,
+                                           structuralOrder, operationEvents,
+                                           accessEvents) ||
+         proveAllRunExecutionsBefore(before, after, graph, structuralOrder,
+                                     operationEvents, accessEvents);
+}
+
 static bool acquireReleaseRunsAlign(
     const AccessRun &acquire, const AccessRun &release,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
@@ -2148,12 +2193,14 @@ static bool acquireReleaseRunsAlign(
          acquire.iterationDomain == release.iterationDomain &&
          (nativeAcquirePrecedesRelease ||
           proveRunBeforeWithinEachIteration(acquire, release, graph,
-                                            operationEvents, accessEvents));
+                                            structuralOrder, operationEvents,
+                                            accessEvents));
 }
 
 static bool proveAlignedAcquireReleaseRuns(
     ArrayRef<const AccessRun *> acquires, ArrayRef<const AccessRun *> releases,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
@@ -2165,16 +2212,15 @@ static bool proveAlignedAcquireReleaseRuns(
         const AccessRun &acquire = *std::get<0>(pair);
         const AccessRun &release = *std::get<1>(pair);
         return acquire.access->numTiles == release.access->numTiles &&
-               acquireReleaseRunsAlign(acquire, release, graph, operationEvents,
-                                       accessEvents);
+               acquireReleaseRunsAlign(acquire, release, graph, structuralOrder,
+                                       operationEvents, accessEvents);
       });
   if (!pairsAreAligned) {
     return false;
   }
   for (std::size_t runIndex = 1; runIndex < acquires.size(); ++runIndex) {
-    if (!proveAllRunExecutionsBefore(*releases[runIndex - 1],
-                                     *acquires[runIndex], graph,
-                                     operationEvents, accessEvents)) {
+    if (!proveRunPrecedes(*releases[runIndex - 1], *acquires[runIndex], graph,
+                          structuralOrder, operationEvents, accessEvents)) {
       return false;
     }
   }
@@ -2184,13 +2230,14 @@ static bool proveAlignedAcquireReleaseRuns(
 static bool
 runIsInsideInterval(const AccessRun &use, const AccessRun &acquire,
                     const AccessRun &release, const HappensBeforeGraph &graph,
+                    const StructuralOperationOrder &structuralOrder,
                     const DenseMap<Operation *, EventPair> &operationEvents,
                     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
                         &accessEvents) {
-  return proveRunBeforeWithinEachIteration(acquire, use, graph, operationEvents,
-                                           accessEvents) &&
-         proveRunBeforeWithinEachIteration(use, release, graph, operationEvents,
-                                           accessEvents);
+  return proveRunBeforeWithinEachIteration(acquire, use, graph, structuralOrder,
+                                           operationEvents, accessEvents) &&
+         proveRunBeforeWithinEachIteration(use, release, graph, structuralOrder,
+                                           operationEvents, accessEvents);
 }
 
 static void appendTransactionRun(SmallVectorImpl<DFBTransactionRun> &runs,
@@ -2222,6 +2269,7 @@ struct CumulativeQueueSideResult {
 static FailureOr<SmallVector<const AccessRun *>>
 orderProtocolRuns(ArrayRef<const AccessRun *> runs,
                   const HappensBeforeGraph &graph,
+                  const StructuralOperationOrder &structuralOrder,
                   const DenseMap<Operation *, EventPair> &operationEvents,
                   const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
                       &accessEvents) {
@@ -2244,16 +2292,10 @@ orderProtocolRuns(ArrayRef<const AccessRun *> runs,
   for (auto [lhsIndex, lhs] : llvm::enumerate(runs)) {
     for (unsigned rhsIndex = lhsIndex + 1; rhsIndex < runs.size(); ++rhsIndex) {
       const AccessRun *rhs = runs[rhsIndex];
-      bool lhsBeforeRhs =
-          proveRunBeforeWithinEachIteration(*lhs, *rhs, graph, operationEvents,
-                                            accessEvents) ||
-          proveAllRunExecutionsBefore(*lhs, *rhs, graph, operationEvents,
-                                      accessEvents);
-      bool rhsBeforeLhs =
-          proveRunBeforeWithinEachIteration(*rhs, *lhs, graph, operationEvents,
-                                            accessEvents) ||
-          proveAllRunExecutionsBefore(*rhs, *lhs, graph, operationEvents,
-                                      accessEvents);
+      bool lhsBeforeRhs = proveRunPrecedes(*lhs, *rhs, graph, structuralOrder,
+                                           operationEvents, accessEvents);
+      bool rhsBeforeLhs = proveRunPrecedes(*rhs, *lhs, graph, structuralOrder,
+                                           operationEvents, accessEvents);
       if (lhsBeforeRhs == rhsBeforeLhs) {
         return failure();
       }
@@ -2279,11 +2321,12 @@ static CumulativeQueueSideResult proveCumulativeQueueSide(
     DFBProtocolEffectKind acquireKind, DFBProtocolEffectKind releaseKind,
     int64_t physicalTileCount, LaunchNodeCoord node,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
-  FailureOr<SmallVector<const AccessRun *>> orderedRuns =
-      orderProtocolRuns(unorderedRuns, graph, operationEvents, accessEvents);
+  FailureOr<SmallVector<const AccessRun *>> orderedRuns = orderProtocolRuns(
+      unorderedRuns, graph, structuralOrder, operationEvents, accessEvents);
   if (failed(orderedRuns)) {
     return {std::nullopt,
             {DFBQuiescenceFailureReason::IncompleteUseOrder,
@@ -2456,6 +2499,7 @@ static bool appendCumulativeEdge(
     SmallVectorImpl<std::pair<unsigned, unsigned>> &edges,
     const AccessRun &release, const AccessRun &acquire, LaunchNodeCoord node,
     const LaunchNodeDomainState &domainState,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
@@ -2470,7 +2514,7 @@ static bool appendCumulativeEdge(
     return false;
   }
   if (releaseEvents->last.completion == acquireEvents->last.completion) {
-    return runPrecedesWithinEachIteration(release, acquire);
+    return runPrecedesWithinEachIteration(release, acquire, structuralOrder);
   }
   edges.emplace_back(releaseEvents->last.completion,
                      acquireEvents->last.completion);
@@ -2482,6 +2526,7 @@ collectCumulativeSynchronizationEdges(
     const CumulativeQueueSide &producer, const CumulativeQueueSide &consumer,
     int64_t physicalTileCount, LaunchNodeCoord node,
     const LaunchNodeDomainState &domainState,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan>
         &accessEvents) {
@@ -2513,7 +2558,8 @@ collectCumulativeSynchronizationEdges(
         required ? findCumulativeRelease(*published, *required) : nullptr;
     if (!publishingPush ||
         !appendCumulativeEdge(synchronizationEdges, *publishingPush, *run, node,
-                              domainState, operationEvents, accessEvents)) {
+                              domainState, structuralOrder, operationEvents,
+                              accessEvents)) {
       return failure();
     }
   }
@@ -2542,7 +2588,8 @@ collectCumulativeSynchronizationEdges(
         findCumulativeRelease(*consumed, *reservationEnd - capacity);
     if (!enablingPop ||
         !appendCumulativeEdge(synchronizationEdges, *enablingPop, *run, node,
-                              domainState, operationEvents, accessEvents)) {
+                              domainState, structuralOrder, operationEvents,
+                              accessEvents)) {
       return failure();
     }
   }
@@ -2633,6 +2680,7 @@ static bool tryAddCumulativeQueueEdges(
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessExecutionCounts &executionCounts, const AccessRuns &accessRuns,
     LaunchNodeCoord node, const LaunchNodeDomainState &domainState,
+    const StructuralOperationOrder &structuralOrder,
     bool includeUnknownDomains) {
   SmallVector<const AccessRun *> producerRuns;
   SmallVector<const AccessRun *> consumerRuns;
@@ -2669,10 +2717,12 @@ static bool tryAddCumulativeQueueEdges(
   }
   CumulativeQueueSideResult producer = proveCumulativeQueueSide(
       producerRuns, DFBProtocolEffectKind::Reserve, DFBProtocolEffectKind::Push,
-      physicalTileCount, node, graph, operationEvents, accessEvents);
+      physicalTileCount, node, graph, structuralOrder, operationEvents,
+      accessEvents);
   CumulativeQueueSideResult consumer = proveCumulativeQueueSide(
       consumerRuns, DFBProtocolEffectKind::Wait, DFBProtocolEffectKind::Pop,
-      physicalTileCount, node, graph, operationEvents, accessEvents);
+      physicalTileCount, node, graph, structuralOrder, operationEvents,
+      accessEvents);
   if (!producer.side || !consumer.side ||
       failed(normalizeCumulativeTransactions(producer.side->cursorRuns,
                                              consumer.side->cursorRuns))) {
@@ -2682,7 +2732,7 @@ static bool tryAddCumulativeQueueEdges(
   FailureOr<SmallVector<std::pair<unsigned, unsigned>>> synchronizationEdges =
       collectCumulativeSynchronizationEdges(
           *producer.side, *consumer.side, physicalTileCount, node, domainState,
-          operationEvents, accessEvents);
+          structuralOrder, operationEvents, accessEvents);
   if (failed(synchronizationEdges)) {
     return false;
   }
@@ -2754,6 +2804,7 @@ static DFBQuiescenceProof computeProtocolLifetime(
     SmallVectorImpl<DFBPerNodeLifetime> &lifetimes,
     SmallVectorImpl<DFBPerNodeLifetimeDiagnostics> *lifetimeDiagnostics,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessExecutionCounts &executionCounts, const AccessRuns &accessRuns,
@@ -2907,11 +2958,11 @@ static DFBQuiescenceProof computeProtocolLifetime(
             reserves.front()->access->operation};
   }
   bool alignedTransactions =
-      proveAlignedAcquireReleaseRuns(reserves, pushes, graph, operationEvents,
-                                     accessEvents) &&
+      proveAlignedAcquireReleaseRuns(reserves, pushes, graph, structuralOrder,
+                                     operationEvents, accessEvents) &&
       (resetTerminatedProducer ||
-       proveAlignedAcquireReleaseRuns(waits, pops, graph, operationEvents,
-                                      accessEvents));
+       proveAlignedAcquireReleaseRuns(waits, pops, graph, structuralOrder,
+                                      operationEvents, accessEvents));
   SmallVector<const AccessRun *> producerProtocolRuns;
   llvm::append_range(producerProtocolRuns, reserves);
   llvm::append_range(producerProtocolRuns, pushes);
@@ -2942,14 +2993,14 @@ static DFBQuiescenceProof computeProtocolLifetime(
     CumulativeQueueSideResult producer = proveCumulativeQueueSide(
         producerProtocolRuns, DFBProtocolEffectKind::Reserve,
         DFBProtocolEffectKind::Push, physicalTileCount, node, graph,
-        operationEvents, accessEvents);
+        structuralOrder, operationEvents, accessEvents);
     if (!producer.side) {
       return producer.failure;
     }
     CumulativeQueueSideResult consumer = proveCumulativeQueueSide(
         consumerProtocolRuns, DFBProtocolEffectKind::Wait,
         DFBProtocolEffectKind::Pop, physicalTileCount, node, graph,
-        operationEvents, accessEvents);
+        structuralOrder, operationEvents, accessEvents);
     if (!consumer.side) {
       return consumer.failure;
     }
@@ -2969,7 +3020,7 @@ static DFBQuiescenceProof computeProtocolLifetime(
     FailureOr<SmallVector<std::pair<unsigned, unsigned>>> synchronizationEdges =
         collectCumulativeSynchronizationEdges(
             *producer.side, *consumer.side, physicalTileCount, node,
-            domainState, operationEvents, accessEvents);
+            domainState, structuralOrder, operationEvents, accessEvents);
     if (failed(synchronizationEdges) ||
         !llvm::all_of(*synchronizationEdges, [&](auto edge) {
           return graph.strictlyPrecedes(edge.first, edge.second);
@@ -3132,12 +3183,13 @@ static DFBQuiescenceProof computeProtocolLifetime(
     const AccessRun &use = accessRuns.at(activeAccess);
     bool covered = false;
     for (auto [reserve, push] : producerIntervals) {
-      covered |= runIsInsideInterval(use, *reserve, *push, graph,
-                                     operationEvents, accessEvents);
+      covered |=
+          runIsInsideInterval(use, *reserve, *push, graph, structuralOrder,
+                              operationEvents, accessEvents);
     }
     for (auto [wait, pop] : consumerIntervals) {
-      covered |= runIsInsideInterval(use, *wait, *pop, graph, operationEvents,
-                                     accessEvents);
+      covered |= runIsInsideInterval(use, *wait, *pop, graph, structuralOrder,
+                                     operationEvents, accessEvents);
     }
     if (!covered) {
       return {DFBQuiescenceFailureReason::IncompleteUseOrder,
@@ -3221,6 +3273,7 @@ static DFBQuiescenceProof computePerNodeLifetime(
     ArrayRef<ValidatedSynchronizedReset> synchronizedResets,
     const ResetBoundaryEvents &resetBoundaryEvents,
     const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessExecutionCounts &executionCounts, const AccessRuns &accessRuns,
@@ -3244,10 +3297,10 @@ static DFBQuiescenceProof computePerNodeLifetime(
     boundaries.push_back({&reset, eventsIt->second});
   }
   if (boundaries.empty()) {
-    return computeProtocolLifetime(logicalDFB, node, lifetimes,
-                                   lifetimeDiagnostics, graph, operationEvents,
-                                   accessEvents, executionCounts, accessRuns,
-                                   domainState, includeUnknownDomains);
+    return computeProtocolLifetime(
+        logicalDFB, node, lifetimes, lifetimeDiagnostics, graph,
+        structuralOrder, operationEvents, accessEvents, executionCounts,
+        accessRuns, domainState, includeUnknownDomains);
   }
 
   for (auto [lhsIndex, lhs] : llvm::enumerate(boundaries)) {
@@ -3341,8 +3394,8 @@ static DFBQuiescenceProof computePerNodeLifetime(
     SmallVector<DFBPerNodeLifetimeDiagnostics, 0> epochDiagnostics;
     DFBQuiescenceProof proof = computeProtocolLifetime(
         logicalDFB, node, epochLifetimes,
-        diagnostics ? &epochDiagnostics : nullptr, graph, operationEvents,
-        accessEvents, executionCounts, accessRuns, domainState,
+        diagnostics ? &epochDiagnostics : nullptr, graph, structuralOrder,
+        operationEvents, accessEvents, executionCounts, accessRuns, domainState,
         includeUnknownDomains, accesses,
         /*hasCanonicalResetTerminator=*/resetTerminated);
     assert(epochLifetimes.size() == 1 &&
@@ -3528,6 +3581,7 @@ static bool unprovenLifecycleIsOutsideReset(
     const DFBLogicalLifecycle &logicalDFB, LaunchNodeCoord node,
     const AccessExecutionCounts &executionCounts, bool includeUnknownDomains,
     EventPair resetEvents, const HappensBeforeGraph &graph,
+    const StructuralOperationOrder &structuralOrder,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
     const AccessRuns &accessRuns, const LaunchNodeDomainState &domainState) {
@@ -3558,7 +3612,8 @@ static bool unprovenLifecycleIsOutsideReset(
              domainState,
              [&](const AccessRun &reserve, const AccessRun &push) {
                return acquireReleaseRunsAlign(reserve, push, graph,
-                                              operationEvents, accessEvents);
+                                              structuralOrder, operationEvents,
+                                              accessEvents);
              }) &&
          !protocolRunsCrossReset(
              logicalDFB, DFBProtocolEffectKind::Push,
@@ -3569,8 +3624,8 @@ static bool unprovenLifecycleIsOutsideReset(
              logicalDFB, DFBProtocolEffectKind::Wait,
              DFBProtocolEffectKind::Pop, accessSides, accessRuns, node,
              domainState, [&](const AccessRun &wait, const AccessRun &pop) {
-               return acquireReleaseRunsAlign(wait, pop, graph, operationEvents,
-                                              accessEvents);
+               return acquireReleaseRunsAlign(wait, pop, graph, structuralOrder,
+                                              operationEvents, accessEvents);
              });
 }
 
@@ -3604,6 +3659,7 @@ static void collectResetAllocationConflicts(
     ArrayRef<ValidatedSynchronizedReset> synchronizedResets,
     const ResetBoundaryEvents &resetBoundaryEvents,
     const HappensBeforeGraph &graph, LaunchNodeCoord node,
+    const StructuralOperationOrder &structuralOrder,
     const AccessExecutionCounts &executionCounts,
     const DenseMap<Operation *, EventPair> &operationEvents,
     const DenseMap<const DFBAccessOccurrence *, AccessEventSpan> &accessEvents,
@@ -3644,8 +3700,8 @@ static void collectResetAllocationConflicts(
                 : unprovenLifecycleIsOutsideReset(
                       logicalDFB, node, executionCounts,
                       /*includeUnknownDomains=*/usePossibleLifetimes,
-                      resetEvents->second, graph, operationEvents, accessEvents,
-                      accessRuns, domainState);
+                      resetEvents->second, graph, structuralOrder,
+                      operationEvents, accessEvents, accessRuns, domainState);
         if (outsideReset) {
           continue;
         }
@@ -3909,9 +3965,10 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
         logicalDFBs, validatedResets, node, graph, operationEvents,
         accessEvents, resetBoundaryEvents, executionCounts, structuralOrder,
         /*includeUnknownDomains=*/false);
-    addProtocolSynchronizationEdges(
-        logicalDFBs, graph, operationEvents, accessEvents, executionCounts,
-        accessRuns, node, domainState, /*includeUnknownDomains=*/false);
+    addProtocolSynchronizationEdges(logicalDFBs, graph, operationEvents,
+                                    accessEvents, executionCounts, accessRuns,
+                                    node, domainState, structuralOrder,
+                                    /*includeUnknownDomains=*/false);
 
     for (auto [logicalIndex, logicalDFB] : llvm::enumerate(logicalDFBs)) {
       if (!knownLaunchNodeDomainContains(logicalDFB.launchDomain, node)) {
@@ -3924,15 +3981,17 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
           allocationDiagnostics
               ? &allocationDiagnostics->nodeLifetimeDiagnostics
               : nullptr,
-          validatedResets, resetBoundaryEvents, graph, operationEvents,
-          accessEvents, executionCounts, accessRuns, domainState);
+          validatedResets, resetBoundaryEvents, graph, structuralOrder,
+          operationEvents, accessEvents, executionCounts, accessRuns,
+          domainState);
       logicalDFB.nodeLifetimes.back().quiescence = proof;
     }
 
     collectResetAllocationConflicts(
         logicalDFBs, validatedResets, resetBoundaryEvents, graph, node,
-        executionCounts, operationEvents, accessEvents, accessRuns, domainState,
-        /*usePossibleLifetimes=*/false, resetAllocationConflicts);
+        structuralOrder, executionCounts, operationEvents, accessEvents,
+        accessRuns, domainState, /*usePossibleLifetimes=*/false,
+        resetAllocationConflicts);
 
     SmallVector<llvm::BitVector> nodeOrdering(
         logicalDFBs.size(), llvm::BitVector(logicalDFBs.size()));
@@ -3983,7 +4042,7 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
     addProtocolSynchronizationEdges(
         logicalDFBs, possibleGraph, possibleOperationEvents,
         possibleAccessEvents, executionCounts, *possibleAccessRuns, node,
-        domainState, /*includeUnknownDomains=*/true);
+        domainState, structuralOrder, /*includeUnknownDomains=*/true);
     for (auto [logicalIndex, logicalDFB] : llvm::enumerate(logicalDFBs)) {
       if (logicalDFB.launchDomain.known) {
         continue;
@@ -3996,16 +4055,17 @@ void DFBConcurrentKernelLivenessAnalysis::analyze(
               ? &allocationDiagnostics->possibleNodeLifetimeDiagnostics
               : nullptr,
           validatedResets, possibleResetBoundaryEvents, possibleGraph,
-          possibleOperationEvents, possibleAccessEvents, executionCounts,
-          *possibleAccessRuns, domainState,
+          structuralOrder, possibleOperationEvents, possibleAccessEvents,
+          executionCounts, *possibleAccessRuns, domainState,
           /*includeUnknownDomains=*/true);
       logicalDFB.possibleNodeLifetimes.back().quiescence = proof;
     }
 
     collectResetAllocationConflicts(
         logicalDFBs, validatedResets, possibleResetBoundaryEvents,
-        possibleGraph, node, executionCounts, possibleOperationEvents,
-        possibleAccessEvents, *possibleAccessRuns, domainState,
+        possibleGraph, node, structuralOrder, executionCounts,
+        possibleOperationEvents, possibleAccessEvents, *possibleAccessRuns,
+        domainState,
         /*usePossibleLifetimes=*/true, resetAllocationConflicts);
 
     SmallVector<llvm::BitVector> conditionalNodeOrdering(
