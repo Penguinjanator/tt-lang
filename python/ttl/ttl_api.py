@@ -1571,6 +1571,13 @@ def _collect_captures(
             return val
         elif isinstance(val, PipeNet):
             return val
+        # A tuple or list of scalars is a compile-time shape or axis list. It
+        # reaches the same consumers as the equivalent literal written inline,
+        # so it stays a Python value rather than becoming an SSA operand.
+        elif isinstance(val, (tuple, list)) and all(
+            isinstance(elt, (int, float)) for elt in val
+        ):
+            return val
         elif val is ScalarType or isinstance(val, ScalarType):
             return val
         elif isinstance(val, DispatchCondition):

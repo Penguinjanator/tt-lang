@@ -59,6 +59,9 @@ from .operators import (
 # Math operations namespace
 from . import ttl_math as math
 
+# Block operations namespace
+from . import ttl_block as block
+
 __all__ = [
     "operation",
     "DFB",
@@ -93,4 +96,5 @@ __all__ = [
     "reset_all_dfbs",
     "reconfigure_dfbs",
     "math",
+    "block",
 ]
