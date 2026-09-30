@@ -2303,7 +2303,9 @@ def TTL_ResetDFBsOp : TTL_Op<"reset_dfbs", [MemoryEffects<[MemWrite]>]> {
     instance per iteration of an equivalent immutable sequential loop nest.
     Before any participant returns, the operation completes prior DFB-interface
     work and restores the listed DFBs to canonical empty protocol state without
-    changing descriptor configuration or payload storage.
+    changing descriptor configuration or payload storage. Listing one member of
+    a DFB allocation group resets every member because the group shares one L1
+    allocation.
 
     The operation resets read and write pointers, the packer write-tile
     pointer, initialization state, and stream occupancy counters. It does not
@@ -2328,11 +2330,16 @@ def TTL_ResetAllDFBsOp
   let description = [{
     `ttl.reset_all_dfbs` has the synchronization and state-reset semantics of
     `ttl.reset_dfbs`, applied to every worker-local DFB allocated by the
-    program. It does not take DFB operands because the complete allocation set
-    is resolved after physical DFB indices are finalized.
+    program except the DFBs listed in `preserved_dfbs`. Preserving one member
+    of a DFB allocation group preserves every member because the group shares
+    one L1 allocation.
   }];
-  let arguments = (ins TTL_SynchronizedDFBResetAttr:$reset);
-  let assemblyFormat = "$reset attr-dict";
+  let arguments = (ins
+    TTL_SynchronizedDFBResetAttr:$reset,
+    Variadic<TTL_CircularBuffer>:$preserved_dfbs
+  );
+  let assemblyFormat = "$reset (`preserve` $preserved_dfbs^ `:` type($preserved_dfbs))? attr-dict";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dis
 import hashlib
 import inspect
 from dataclasses import dataclass, field
@@ -307,6 +308,8 @@ def _encode_identity_literal(value) -> Optional[bytes]:
         return f"str:{len(encoded)}:".encode("ascii") + encoded
     if isinstance(value, ScalarType):
         return f"scalar:{value.name}".encode("ascii")
+    if isinstance(value, KernelKind):
+        return f"kernel-kind:{value.value}".encode("utf-8")
     if isinstance(value, (tuple, list)):
         elements = []
         for element in value:
@@ -360,15 +363,29 @@ def _encode_identity_capture(
     )
 
 
+_GLOBAL_LOAD_OPNAMES = frozenset({"LOAD_GLOBAL", "LOAD_NAME"})
+_CLOSURE_LOAD_OPNAMES = frozenset(
+    {"LOAD_DEREF", "LOAD_CLASSDEREF", "LOAD_FROM_DICT_OR_DEREF"}
+)
+
+
 def _referenced_operation_values(function: Callable) -> dict[str, object]:
     """Return outer-scope values referenced by an operation or nested code."""
 
+    # co_names also holds attribute names, and nested code objects dereference
+    # the operation's own locals, so only global loads and loads of the
+    # operation's free variables name outer-scope values.
+    closure_names = set(function.__code__.co_freevars)
     referenced_names = set()
     code_objects = [function.__code__]
     while code_objects:
         code = code_objects.pop()
-        referenced_names.update(code.co_names)
-        referenced_names.update(code.co_freevars)
+        for instruction in dis.get_instructions(code):
+            if instruction.opname in _GLOBAL_LOAD_OPNAMES or (
+                instruction.opname in _CLOSURE_LOAD_OPNAMES
+                and instruction.argval in closure_names
+            ):
+                referenced_names.add(instruction.argval)
         code_objects.extend(
             constant for constant in code.co_consts if inspect.iscode(constant)
         )
@@ -486,6 +503,9 @@ def _operation_identity_impl(function: Callable, active_functions: set[int]) -> 
                 ordinal = reset_ordinals.setdefault(reset_identity, len(reset_ordinals))
                 participant_tokens = []
                 for participant in value.participants:
+                    if isinstance(participant, KernelKind):
+                        participant_tokens.append(f"kind:{participant.name}")
+                        continue
                     if participant._implicit_role is not None:
                         participant_tokens.append(
                             "role:"
@@ -566,6 +586,11 @@ def _bind_kernel_declarations(
     logical_kernels: Mapping[str, Kernel], operation_identity: str
 ) -> None:
     """Bind uniquely named declarations during operation registration."""
+    logical_kernels = {
+        name: kernel
+        for name, kernel in logical_kernels.items()
+        if _selector_implicit_role(kernel) is None
+    }
     source_names = {}
     for name, kernel in logical_kernels.items():
         previous_name = source_names.get(id(kernel))
