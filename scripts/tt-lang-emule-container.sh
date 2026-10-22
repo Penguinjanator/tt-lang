@@ -12,7 +12,14 @@ set -euo pipefail
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 _REPO_ROOT="$(dirname "$_SCRIPT_DIR")"
 readonly _SCRIPT_DIR _REPO_ROOT
-readonly _STACK_MANIFEST="${_REPO_ROOT}/config/tt-lang-emule-stack.json"
+_STACK_MANIFEST="${TTLANG_EMULE_STACK_MANIFEST:-${_REPO_ROOT}/config/tt-lang-emule-stack.json}"
+# The image input ID is computed from the repository root, so a relative
+# setting must name the file from the caller's directory before that.
+case "$_STACK_MANIFEST" in
+    /*) ;;
+    *) _STACK_MANIFEST="${PWD}/${_STACK_MANIFEST}" ;;
+esac
+readonly _STACK_MANIFEST
 readonly _STACK_TOOL="${_SCRIPT_DIR}/tt-lang-emule-stack.py"
 readonly _PYTHON="${TTLANG_EMULE_HOST_PYTHON:-python3}"
 
@@ -408,6 +415,22 @@ if [ "$_BUILD_IMAGE" -eq 1 ]; then
         "${_REPO_ROOT}/.github/containers"
 fi
 
+if _IMAGE_INSPECTION="$("$_DOCKER" image inspect -- "$_IMAGE")"; then
+    :
+else
+    _IMAGE_INSPECT_STATUS=$?
+    echo "tt-lang-sim: cannot verify image provenance for ${_IMAGE}." >&2
+    exit "$_IMAGE_INSPECT_STATUS"
+fi
+if ! _VERIFIED_IMAGE="$(
+    "$_PYTHON" "$_STACK_TOOL" --manifest "$_STACK_MANIFEST" validate-image \
+        --platform "$_PLATFORM" <<< "$_IMAGE_INSPECTION"
+)"; then
+    echo "tt-lang-sim: image ${_IMAGE} does not match the selected emulator stack." >&2
+    echo "Select a matching image or reinstall with TTLANG_EMULE_REBUILD=1 scripts/install-tt-lang-emule.sh." >&2
+    exit 1
+fi
+
 cleanup
 if [ "${TTLANG_EMULE_INSTALL:-0}" = "1" ]; then
     printf 'Runtime image: %s\n' "$_IMAGE"
@@ -416,6 +439,6 @@ if [ "${TTLANG_EMULE_INSTALL:-0}" = "1" ]; then
 fi
 if [ "${TTLANG_EMULE_INSTALL:-0}" = "1" ] || \
    [ "${TTLANG_EMULE_SHELL:-0}" = "1" ]; then
-    exec "$_DOCKER" "${_RUN_ARGS[@]}" "$_IMAGE"
+    exec "$_DOCKER" "${_RUN_ARGS[@]}" "$_VERIFIED_IMAGE"
 fi
-exec "$_DOCKER" "${_RUN_ARGS[@]}" "$_IMAGE" "$_CONTAINER_SCRIPT" "$@"
+exec "$_DOCKER" "${_RUN_ARGS[@]}" "$_VERIFIED_IMAGE" "$_CONTAINER_SCRIPT" "$@"
